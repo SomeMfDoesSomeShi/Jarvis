@@ -1,4 +1,3 @@
-
 (() => {
   "use strict";
 
@@ -6,18 +5,35 @@
 
   const PROJECTS_KEY = "jarvis_projects_v1";
   const SETTINGS_KEY = "jarvis_settings_v1";
+  const GROQ_URL = "https://api.groq.com/openai/v1/chat/completions";
 
   const DEFAULT_SYSTEM = `
-You are JARVIS, a calm, intelligent and capable personal AI assistant.
-You speak naturally and concisely.
-You help with technology, programming and everyday tasks.
-You are running in a browser on a Meta Quest headset.
-Never claim to control hardware or applications you cannot access.
-Explain technical procedures clearly.
+You are JARVIS, a calm, intelligent and highly capable personal AI assistant.
+You speak naturally and concisely. English is your primary language.
+You help with technology, programming, project creation and everyday tasks.
+
+You are running in a browser on a Meta Quest headset or desktop computer.
+You have access to a user-authorized workspace folder through the available tools.
+
+IMPORTANT WORKSPACE RULES:
+- You can only access files inside the folder explicitly selected by the user.
+- Never claim to access the rest of the PC.
+- Use the file tools to inspect, create, read and modify project files.
+- You can autonomously complete multi-step projects using the available tools.
+- Inspect existing files before modifying them.
+- When replacing a file, the application creates a backup when possible.
+- Deleted files are moved to .jarvis-trash rather than permanently erased.
+- Do not invent successful file operations. Check tool results.
+- Do not attempt to execute shell commands or launch native PC programs.
+- HTML, CSS and JavaScript projects can be previewed in the browser.
+- Python and other native programs cannot automatically run through this static website.
+- Explain limitations clearly.
+- Keep answers concise, useful and natural.
 `;
 
   let apiKey = sessionStorage.getItem("jarvis_groq_key") || "";
   let history = [];
+
   let settings = loadJSON(SETTINGS_KEY, {
     model: "openai/gpt-oss-20b",
     language: "en-US",
@@ -36,6 +52,11 @@ Explain technical procedures clearly.
   let lastAssistantSpeech = "";
   let requestQueue = [];
   let processingQueue = false;
+
+  // FILE WORKSPACE STATE
+  let workspaceHandle = null;
+  let activeFilePath = null;
+  let activeFileHandle = null;
 
   // --------------------------------------------------
   // STORAGE
@@ -73,8 +94,6 @@ Explain technical procedures clearly.
   function setBusy(value) {
     busy = value;
 
-    // The previous version referred to a nonexistent
-    // sendButton ID. This version selects the real button.
     const sendButton = document.querySelector(
       "#chatForm button[type='submit']"
     );
@@ -181,7 +200,749 @@ Explain technical procedures clearly.
   }
 
   // --------------------------------------------------
-  // GROQ API + REQUEST QUEUE
+  // FILE SYSTEM ACCESS
+  // --------------------------------------------------
+
+  function hasWorkspace() {
+    return workspaceHandle !== null;
+  }
+
+  function requireWorkspace() {
+    if (!workspaceHandle) {
+      throw new Error(
+        "No workspace folder is connected. Ask the user to connect a folder first."
+      );
+    }
+  }
+
+  function validatePath(path) {
+    if (typeof path !== "string") {
+      throw new Error("Invalid file path.");
+    }
+
+    const normalized = path.replace(/\\/g, "/").trim();
+
+    if (
+      normalized.startsWith("/") ||
+      /^[a-zA-Z]:/.test(normalized)
+    ) {
+      throw new Error("Absolute paths are not allowed.");
+    }
+
+    const parts = normalized.split("/").filter(Boolean);
+
+    if (
+      parts.some(part =>
+        part === "." ||
+        part === ".." ||
+        part.includes("\0")
+      )
+    ) {
+      throw new Error("This path is not allowed.");
+    }
+
+    return parts;
+  }
+
+  async function getDirectory(parts, create = false) {
+    requireWorkspace();
+
+    let directory = workspaceHandle;
+
+    for (const part of parts) {
+      directory = await directory.getDirectoryHandle(
+        part,
+        { create }
+      );
+    }
+
+    return directory;
+  }
+
+  async function getFileHandle(path, create = false) {
+    const parts = validatePath(path);
+
+    if (!parts.length) {
+      throw new Error("A file path is required.");
+    }
+
+    const directory = await getDirectory(
+      parts.slice(0, -1),
+      create
+    );
+
+    return directory.getFileHandle(
+      parts[parts.length - 1],
+      { create }
+    );
+  }
+
+  async function readWorkspaceFile(path) {
+    const handle = await getFileHandle(path);
+    const file = await handle.getFile();
+
+    if (file.size > 2_000_000) {
+      throw new Error(
+        "This file is larger than 2 MB. It cannot be loaded into the editor."
+      );
+    }
+
+    return await file.text();
+  }
+
+  async function writeWorkspaceFile(path, content) {
+    requireWorkspace();
+
+    if (typeof content !== "string") {
+      throw new Error("File content must be text.");
+    }
+
+    if (content.length > 1_500_000) {
+      throw new Error("This file is too large for the workspace editor.");
+    }
+
+    const parts = validatePath(path);
+
+    if (!parts.length) {
+      throw new Error("A file path is required.");
+    }
+
+    const filename = parts[parts.length - 1];
+    const parent = await getDirectory(
+      parts.slice(0, -1),
+      true
+    );
+
+    // Keep a backup when a file is overwritten.
+    let existingHandle = null;
+
+    try {
+      existingHandle = await parent.getFileHandle(filename);
+    } catch {
+      // File does not exist yet.
+    }
+
+    if (existingHandle) {
+      const oldFile = await existingHandle.getFile();
+
+      if (oldFile.size <= 1_500_000) {
+        const backupDirectory = await getDirectory(
+          [".jarvis-backups"],
+          true
+        );
+
+        const timestamp = new Date()
+          .toISOString()
+          .replace(/[:.]/g, "-");
+
+        const backupName =
+          filename + "." + timestamp + ".bak";
+
+        const backupHandle =
+          await backupDirectory.getFileHandle(
+            backupName,
+            { create: true }
+          );
+
+        const backupWriter =
+          await backupHandle.createWritable();
+
+        await backupWriter.write(await oldFile.text());
+        await backupWriter.close();
+      }
+    }
+
+    const fileHandle = await parent.getFileHandle(
+      filename,
+      { create: true }
+    );
+
+    const writer = await fileHandle.createWritable();
+
+    await writer.write(content);
+    await writer.close();
+
+    return `Successfully saved ${path}.`;
+  }
+
+  async function listWorkspaceFolder(path = "") {
+    requireWorkspace();
+
+    const parts = validatePath(path);
+    const directory = await getDirectory(parts);
+    const entries = [];
+
+    for await (const [name, handle] of directory.entries()) {
+      if (
+        parts.length === 0 &&
+        (name === ".jarvis-backups" ||
+         name === ".jarvis-trash")
+      ) {
+        continue;
+      }
+
+      entries.push({
+        name,
+        kind: handle.kind,
+        path: [...parts, name].join("/")
+      });
+    }
+
+    entries.sort((a, b) => {
+      if (a.kind !== b.kind) {
+        return a.kind === "directory" ? -1 : 1;
+      }
+
+      return a.name.localeCompare(b.name);
+    });
+
+    return entries;
+  }
+
+  async function createWorkspaceDirectory(path) {
+    const parts = validatePath(path);
+
+    if (!parts.length) {
+      throw new Error("A directory path is required.");
+    }
+
+    await getDirectory(parts, true);
+
+    await refreshFileTree();
+
+    return `Directory created: ${path}`;
+  }
+
+  async function moveFileToTrash(path) {
+    const parts = validatePath(path);
+
+    if (!parts.length) {
+      throw new Error("Invalid file path.");
+    }
+
+    const filename = parts[parts.length - 1];
+    const sourceHandle = await getFileHandle(path);
+    const sourceFile = await sourceHandle.getFile();
+
+    const trashDirectory = await getDirectory(
+      [".jarvis-trash"],
+      true
+    );
+
+    const timestamp = new Date()
+      .toISOString()
+      .replace(/[:.]/g, "-");
+
+    const trashName = `${filename}.${timestamp}.deleted`;
+
+    const trashHandle = await trashDirectory.getFileHandle(
+      trashName,
+      { create: true }
+    );
+
+    const writer = await trashHandle.createWritable();
+
+    await writer.write(await sourceFile.arrayBuffer());
+    await writer.close();
+
+    const parent = await getDirectory(parts.slice(0, -1));
+
+    await parent.removeEntry(filename);
+
+    await refreshFileTree();
+
+    return `${path} was moved to .jarvis-trash. It was not permanently deleted.`;
+  }
+
+  // --------------------------------------------------
+  // FILE EXPLORER
+  // --------------------------------------------------
+
+  async function refreshFileTree() {
+    const tree = $("fileTree");
+
+    if (!workspaceHandle) {
+      tree.innerHTML =
+        '<div class="empty-state">Connect a folder to browse its files.</div>';
+      return;
+    }
+
+    tree.replaceChildren();
+
+    async function renderDirectory(path = "", depth = 0) {
+      const entries = await listWorkspaceFolder(path);
+
+      for (const entry of entries) {
+        const button = document.createElement("button");
+
+        button.className =
+          "file-entry " +
+          (entry.kind === "directory" ? "directory" : "file");
+
+        button.style.paddingLeft =
+          `${7 + depth * 15}px`;
+
+        const icon = document.createElement("span");
+        icon.textContent =
+          entry.kind === "directory" ? "📁" : "📄";
+
+        const name = document.createElement("span");
+        name.className = "file-name";
+        name.textContent = entry.name;
+
+        button.append(icon, name);
+
+        if (entry.kind === "file") {
+          button.addEventListener("click", () => {
+            openWorkspaceFile(entry.path);
+          });
+        } else {
+          button.addEventListener("click", async () => {
+            const existing = tree.querySelector(
+              `[data-folder="${CSS.escape(entry.path)}"]`
+            );
+
+            if (existing) {
+              existing.remove();
+              return;
+            }
+
+            const holder = document.createElement("div");
+            holder.dataset.folder = entry.path;
+
+            button.after(holder);
+
+            await renderDirectoryInto(
+              holder,
+              entry.path,
+              depth + 1
+            );
+          });
+        }
+
+        tree.appendChild(button);
+      }
+    }
+
+    async function renderDirectoryInto(
+      container,
+      path,
+      depth
+    ) {
+      const entries = await listWorkspaceFolder(path);
+
+      for (const entry of entries) {
+        const button = document.createElement("button");
+
+        button.className =
+          "file-entry " +
+          (entry.kind === "directory" ? "directory" : "file");
+
+        button.style.paddingLeft =
+          `${7 + depth * 15}px`;
+
+        const icon = document.createElement("span");
+        icon.textContent =
+          entry.kind === "directory" ? "📁" : "📄";
+
+        const name = document.createElement("span");
+        name.className = "file-name";
+        name.textContent = entry.name;
+
+        button.append(icon, name);
+
+        if (entry.kind === "file") {
+          button.addEventListener("click", () => {
+            openWorkspaceFile(entry.path);
+          });
+        } else {
+          button.addEventListener("click", async () => {
+            const existing = container.querySelector(
+              `[data-folder="${CSS.escape(entry.path)}"]`
+            );
+
+            if (existing) {
+              existing.remove();
+              return;
+            }
+
+            const holder = document.createElement("div");
+            holder.dataset.folder = entry.path;
+
+            button.after(holder);
+
+            await renderDirectoryInto(
+              holder,
+              entry.path,
+              depth + 1
+            );
+          });
+        }
+
+        container.appendChild(button);
+      }
+    }
+
+    await renderDirectory();
+
+    if (!tree.children.length) {
+      tree.innerHTML =
+        '<div class="empty-state">This folder is empty.</div>';
+    }
+  }
+
+  async function openWorkspaceFile(path) {
+    try {
+      const handle = await getFileHandle(path);
+      const file = await handle.getFile();
+
+      if (file.size > 2_000_000) {
+        throw new Error(
+          "This file is too large to open in the editor."
+        );
+      }
+
+      const content = await file.text();
+
+      activeFilePath = path;
+      activeFileHandle = handle;
+      activeProjectId = null;
+
+      $("editorName").textContent = path;
+      $("codeEditor").value = content;
+      $("saveStatus").textContent = "PC FILE OPENED";
+
+      $("runPreview").disabled =
+        !path.toLowerCase().endsWith(".html");
+
+      document.querySelectorAll(".file-entry").forEach(item => {
+        item.classList.remove("active");
+      });
+
+      const matching = [...document.querySelectorAll(".file-entry")]
+        .find(item => item.textContent.trim().endsWith(path.split("/").pop()));
+
+      matching?.classList.add("active");
+
+    } catch (error) {
+      addMessage(
+        "assistant",
+        "I couldn't open that file: " + error.message
+      );
+    }
+  }
+
+  async function saveActiveFile() {
+    if (activeFilePath) {
+      await writeWorkspaceFile(
+        activeFilePath,
+        $("codeEditor").value
+      );
+
+      $("saveStatus").textContent = "PC FILE SAVED ✓";
+
+      await refreshFileTree();
+
+      return;
+    }
+
+    saveCode();
+  }
+
+  // --------------------------------------------------
+  // PROJECT PREVIEW
+  // --------------------------------------------------
+
+  async function previewHtmlFile(path) {
+    const html = await readWorkspaceFile(path);
+
+    $("projectPreview").srcdoc = html;
+    $("previewStatus").textContent = "PREVIEW: " + path;
+  }
+
+  function previewCurrentProject() {
+    const project = projects.find(
+      item => item.id === activeProjectId
+    );
+
+    if (!project) {
+      addMessage(
+        "assistant",
+        "Select a project before trying to preview it."
+      );
+      return;
+    }
+
+    $("projectPreview").srcdoc = project.code;
+    $("previewStatus").textContent =
+      "LOCAL PROJECT PREVIEW";
+  }
+
+  // --------------------------------------------------
+  // GROQ TOOLS
+  // --------------------------------------------------
+
+  const availableTools = [
+    {
+      type: "function",
+      function: {
+        name: "list_files",
+        description:
+          "List files and folders in the authorized workspace. Use an empty path for the root folder.",
+        parameters: {
+          type: "object",
+          properties: {
+            path: {
+              type: "string",
+              description: "Relative folder path."
+            }
+          },
+          required: ["path"]
+        }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "read_file",
+        description:
+          "Read a text file from the authorized workspace.",
+        parameters: {
+          type: "object",
+          properties: {
+            path: { type: "string" }
+          },
+          required: ["path"]
+        }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "write_file",
+        description:
+          "Create or replace a text file in the authorized workspace. Existing files are backed up when possible.",
+        parameters: {
+          type: "object",
+          properties: {
+            path: { type: "string" },
+            content: { type: "string" }
+          },
+          required: ["path", "content"]
+        }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "create_directory",
+        description:
+          "Create a directory inside the authorized workspace.",
+        parameters: {
+          type: "object",
+          properties: {
+            path: { type: "string" }
+          },
+          required: ["path"]
+        }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "delete_file",
+        description:
+          "Move a file into .jarvis-trash inside the authorized workspace. This does not permanently delete it.",
+        parameters: {
+          type: "object",
+          properties: {
+            path: { type: "string" }
+          },
+          required: ["path"]
+        }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "preview_file",
+        description:
+          "Display an HTML file from the authorized workspace in the project preview.",
+        parameters: {
+          type: "object",
+          properties: {
+            path: { type: "string" }
+          },
+          required: ["path"]
+        }
+      }
+    }
+  ];
+
+  async function executeTool(name, args) {
+    switch (name) {
+      case "list_files": {
+        const entries = await listWorkspaceFolder(
+          args.path || ""
+        );
+
+        return JSON.stringify(entries, null, 2);
+      }
+
+      case "read_file": {
+        return await readWorkspaceFile(args.path);
+      }
+
+      case "write_file": {
+        const result = await writeWorkspaceFile(
+          args.path,
+          args.content
+        );
+
+        await refreshFileTree();
+
+        return result;
+      }
+
+      case "create_directory": {
+        return await createWorkspaceDirectory(args.path);
+      }
+
+      case "delete_file": {
+        return await moveFileToTrash(args.path);
+      }
+
+      case "preview_file": {
+        if (!args.path.toLowerCase().endsWith(".html")) {
+          throw new Error("Only HTML files can be previewed.");
+        }
+
+        await previewHtmlFile(args.path);
+
+        return `Preview loaded: ${args.path}`;
+      }
+
+      default:
+        throw new Error("Unknown tool: " + name);
+    }
+  }
+
+  // --------------------------------------------------
+  // GROQ API
+  // --------------------------------------------------
+
+  async function groqRequest(messages) {
+    const response = await fetch(GROQ_URL, {
+      method: "POST",
+      headers: {
+        "Authorization": "Bearer " + apiKey,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        model: settings.model,
+        messages,
+        tools: availableTools,
+        tool_choice: "auto",
+        temperature: 0.5,
+        max_completion_tokens: 1800,
+        stream: false
+      })
+    });
+
+    const data = await response.json().catch(() => ({}));
+
+    if (!response.ok) {
+      throw new Error(
+        data?.error?.message || "HTTP " + response.status
+      );
+    }
+
+    return data?.choices?.[0]?.message;
+  }
+
+  async function processAgentRequest(userText) {
+    const messages = [
+      {
+        role: "system",
+        content:
+          settings.systemPrompt +
+          "\n\nWorkspace connected: " +
+          (workspaceHandle ? workspaceHandle.name : "No") +
+          ". Only use workspace tools when a folder is connected."
+      },
+      ...history.slice(-16)
+    ];
+
+    let response = null;
+    let step = 0;
+
+    // Limit tool cycles to prevent an endless loop.
+    while (step < 8) {
+      step++;
+
+      response = await groqRequest(messages);
+
+      if (!response) {
+        throw new Error("The AI returned an empty response.");
+      }
+
+      messages.push(response);
+
+      if (!response.tool_calls || !response.tool_calls.length) {
+        break;
+      }
+
+      for (const call of response.tool_calls) {
+        let result;
+
+        try {
+          const args = JSON.parse(
+            call.function.arguments || "{}"
+          );
+
+          if (!workspaceHandle) {
+            throw new Error(
+              "No PC folder is connected. Connect a folder before asking me to access files."
+            );
+          }
+
+          result = await executeTool(
+            call.function.name,
+            args
+          );
+
+        } catch (error) {
+          result = "Tool error: " + error.message;
+        }
+
+        messages.push({
+          role: "tool",
+          tool_call_id: call.id,
+          name: call.function.name,
+          content: String(result).slice(0, 14000)
+        });
+      }
+    }
+
+    if (response?.tool_calls?.length && step >= 8) {
+      messages.push({
+        role: "system",
+        content:
+          "The tool-call limit was reached. Summarize what has been completed and what remains."
+      });
+
+      response = await groqRequest(messages);
+    }
+
+    const answer =
+      response?.content?.trim() ||
+      "The requested operations have been processed.";
+
+    return answer;
+  }
+
+  // --------------------------------------------------
+  // CHAT + REQUEST QUEUE
   // --------------------------------------------------
 
   function sendToJarvis(text) {
@@ -199,11 +960,10 @@ Explain technical procedures clearly.
       return;
     }
 
-    // Display the user's message immediately.
     addMessage("user", message);
 
-    // Queue messages so they are processed in order.
     requestQueue.push(message);
+
     processQueue();
   }
 
@@ -221,52 +981,19 @@ Explain technical procedures clearly.
       });
 
       setBusy(true);
-      setStatus("CONNECTING TO GROQ...");
+      setStatus("CONNECTING TO JARVIS...");
 
       try {
-        const response = await fetch(
-          "https://api.groq.com/openai/v1/chat/completions",
-          {
-            method: "POST",
-            headers: {
-              "Authorization": "Bearer " + apiKey,
-              "Content-Type": "application/json"
-            },
-            body: JSON.stringify({
-              model: settings.model,
-              messages: [
-                {
-                  role: "system",
-                  content: settings.systemPrompt
-                },
-                ...history.slice(-16)
-              ],
-              temperature: 0.65,
-              max_completion_tokens: 1200,
-              stream: false
-            })
-          }
-        );
-
-        const data = await response.json().catch(() => ({}));
-
-        if (!response.ok) {
-          throw new Error(
-            data?.error?.message || "HTTP " + response.status
-          );
-        }
-
-        const answer =
-          data?.choices?.[0]?.message?.content?.trim();
-
-        if (!answer) {
-          throw new Error("Groq returned an empty response.");
-        }
+        const answer = await processAgentRequest(userText);
 
         history.push({
           role: "assistant",
           content: answer
         });
+
+        if (history.length > 30) {
+          history = history.slice(-24);
+        }
 
         addMessage("assistant", answer, true);
         speak(answer);
@@ -274,11 +1001,11 @@ Explain technical procedures clearly.
         setStatus("SYSTEM READY");
 
       } catch (error) {
-        console.error("Groq request failed:", error);
+        console.error("JARVIS request failed:", error);
 
         addMessage(
           "assistant",
-          "API ERROR: " + error.message +
+          "SYSTEM ERROR: " + error.message +
           "\n\nCheck your API key, model, Internet connection and Groq account limits."
         );
 
@@ -381,7 +1108,6 @@ Explain technical procedures clearly.
       }
     };
 
-    // Attempt to interrupt JARVIS as soon as speech is detected.
     recognition.onspeechstart = () => {
       if (
         listening &&
@@ -414,8 +1140,6 @@ Explain technical procedures clearly.
 
       if (!finalText) return;
 
-      // Try to ignore JARVIS's own voice if the microphone
-      // picks it up through the headset speakers.
       const normalized = normalizeText(finalText);
 
       if (
@@ -429,8 +1153,6 @@ Explain technical procedures clearly.
       $("voiceHint").textContent =
         "Recognized: " + finalText;
 
-      // Automatically send the recognized phrase.
-      // No Enter key or extra button press needed.
       sendToJarvis(finalText);
     };
 
@@ -452,14 +1174,111 @@ Explain technical procedures clearly.
     recognition.onend = () => {
       restartingRecognition = false;
 
-      // Some browsers stop recognition after a while.
-      // Restart it while continuous mode is enabled.
       if (listening) {
         window.setTimeout(() => {
           startRecognitionEngine();
         }, 350);
       }
     };
+  }
+
+  // --------------------------------------------------
+  // CONNECT / DISCONNECT PC FOLDER
+  // --------------------------------------------------
+
+  async function connectWorkspace() {
+    if (!window.showDirectoryPicker) {
+      addMessage(
+        "assistant",
+        "This browser does not support the File System Access API. Try a recent desktop version of Chrome or Edge, using the HTTPS GitHub Pages address."
+      );
+      return;
+    }
+
+    try {
+      const selectedFolder =
+        await window.showDirectoryPicker({
+          mode: "readwrite"
+        });
+
+      const permission =
+        await selectedFolder.requestPermission({
+          mode: "readwrite"
+        });
+
+      if (permission !== "granted") {
+        throw new Error("Read/write permission was not granted.");
+      }
+
+      workspaceHandle = selectedFolder;
+
+      $("workspaceStatus").textContent = "CONNECTED";
+      $("workspaceDescription").textContent =
+        selectedFolder.name;
+
+      $("folderPermissionBadge").textContent =
+        "READ / WRITE AUTHORIZED";
+
+      $("folderPermissionBadge").classList.add("connected");
+
+      $("folderDescription").textContent =
+        "JARVIS can now manage files inside this folder.";
+
+      $("folderPath").textContent =
+        "Authorized folder: " + selectedFolder.name;
+
+      $("disconnectFolder").disabled = false;
+
+      await refreshFileTree();
+
+      addMessage(
+        "assistant",
+        `Workspace connected: ${selectedFolder.name}.\n\nI can now list, read, create and edit files inside this folder. I cannot access files outside it.`
+      );
+
+    } catch (error) {
+      if (error.name !== "AbortError") {
+        addMessage(
+          "assistant",
+          "Folder connection failed: " + error.message
+        );
+      }
+    }
+  }
+
+  function disconnectWorkspace() {
+    workspaceHandle = null;
+    activeFilePath = null;
+    activeFileHandle = null;
+
+    $("workspaceStatus").textContent = "DISCONNECTED";
+    $("workspaceDescription").textContent =
+      "No folder authorized";
+
+    $("folderPermissionBadge").textContent =
+      "NOT CONNECTED";
+
+    $("folderPermissionBadge").classList.remove("connected");
+
+    $("folderDescription").textContent =
+      "Authorize a folder to let JARVIS create, read and edit files inside it.";
+
+    $("folderPath").textContent = "No folder selected";
+
+    $("disconnectFolder").disabled = true;
+
+    $("fileTree").innerHTML =
+      '<div class="empty-state">Connect a folder to browse its files.</div>';
+
+    $("editorName").textContent = "No file selected";
+    $("codeEditor").value = "";
+    $("saveStatus").textContent = "READY";
+    $("runPreview").disabled = true;
+
+    addMessage(
+      "assistant",
+      "The PC workspace has been disconnected. I no longer have access to that folder."
+    );
   }
 
   // --------------------------------------------------
@@ -505,8 +1324,11 @@ Explain technical procedures clearly.
 
         if (activeProjectId === project.id) {
           activeProjectId = null;
+          activeFilePath = null;
+
           $("editorName").textContent = "No file selected";
           $("codeEditor").value = "";
+          $("runPreview").disabled = true;
         }
 
         saveJSON(PROJECTS_KEY, projects);
@@ -524,12 +1346,16 @@ Explain technical procedures clearly.
     if (!project) return;
 
     activeProjectId = id;
+    activeFilePath = null;
+    activeFileHandle = null;
 
     $("editorName").textContent =
       project.name + " / main.txt";
 
     $("codeEditor").value = project.code || "";
     $("saveStatus").textContent = "PROJECT LOADED";
+
+    $("runPreview").disabled = false;
   }
 
   function createProject() {
@@ -555,6 +1381,7 @@ Explain technical procedures clearly.
     if (!saveJSON(PROJECTS_KEY, projects)) return;
 
     activeProjectId = project.id;
+    activeFilePath = null;
 
     renderProjects();
     openProject(project.id);
@@ -569,7 +1396,8 @@ Explain technical procedures clearly.
     );
 
     if (!project) {
-      $("saveStatus").textContent = "NO PROJECT OPEN";
+      $("saveStatus").textContent =
+        "NO PROJECT OPEN";
       return;
     }
 
@@ -582,17 +1410,23 @@ Explain technical procedures clearly.
   }
 
   function exportCode() {
+    const content = $("codeEditor").value;
+
+    if (!content.trim()) {
+      $("saveStatus").textContent = "NOTHING TO EXPORT";
+      return;
+    }
+
     const project = projects.find(
       item => item.id === activeProjectId
     );
 
-    if (!project) {
-      $("saveStatus").textContent = "NO PROJECT OPEN";
-      return;
-    }
+    const filename = activeFilePath
+      ? activeFilePath.split("/").pop()
+      : (project?.name || "jarvis-project") + ".txt";
 
     const blob = new Blob(
-      [$("codeEditor").value],
+      [content],
       { type: "text/plain;charset=utf-8" }
     );
 
@@ -600,8 +1434,7 @@ Explain technical procedures clearly.
     const link = document.createElement("a");
 
     link.href = url;
-    link.download =
-      project.name.replace(/[^a-z0-9_-]/gi, "_") + ".txt";
+    link.download = filename;
 
     document.body.appendChild(link);
     link.click();
@@ -633,7 +1466,12 @@ Explain technical procedures clearly.
         $("systemPrompt").value.trim() || DEFAULT_SYSTEM
     };
 
-    sessionStorage.setItem("jarvis_groq_key", apiKey);
+    if (apiKey) {
+      sessionStorage.setItem("jarvis_groq_key", apiKey);
+    } else {
+      sessionStorage.removeItem("jarvis_groq_key");
+    }
+
     saveJSON(SETTINGS_KEY, settings);
 
     $("tokenNote").textContent =
@@ -690,7 +1528,7 @@ Explain technical procedures clearly.
 
       $("settingsStatus").textContent =
         "Connection failed: " + error.message +
-        ". Try testing from your GitHub Pages website.";
+        ". Check your key and try again.";
     }
   };
 
@@ -777,7 +1615,15 @@ Explain technical procedures clearly.
     }
   };
 
-  $("saveCode").onclick = saveCode;
+  $("saveCode").onclick = () => {
+    saveActiveFile().catch(error => {
+      addMessage(
+        "assistant",
+        "Save failed: " + error.message
+      );
+    });
+  };
+
   $("downloadCode").onclick = exportCode;
 
   $("copyCode").onclick = async () => {
@@ -794,6 +1640,34 @@ Explain technical procedures clearly.
     }
   };
 
+  $("connectFolder").onclick = connectWorkspace;
+
+  $("disconnectFolder").onclick = disconnectWorkspace;
+
+  $("refreshFiles").onclick = () => {
+    refreshFileTree().catch(error => {
+      addMessage(
+        "assistant",
+        "Could not refresh files: " + error.message
+      );
+    });
+  };
+
+  $("runPreview").onclick = async () => {
+    if (activeFilePath) {
+      try {
+        await previewHtmlFile(activeFilePath);
+      } catch (error) {
+        addMessage(
+          "assistant",
+          "Preview failed: " + error.message
+        );
+      }
+    } else {
+      previewCurrentProject();
+    }
+  };
+
   // --------------------------------------------------
   // STARTUP
   // --------------------------------------------------
@@ -804,13 +1678,19 @@ Explain technical procedures clearly.
   $("aiStatus").textContent =
     apiKey ? "READY" : "OFFLINE";
 
+  $("systemPrompt").value = settings.systemPrompt;
+
   renderProjects();
   initSpeechRecognition();
+  updateVoiceButton();
 
   if (!("speechSynthesis" in window)) {
     $("speakToggle").checked = false;
   }
 
-  updateVoiceButton();
+  if (!window.showDirectoryPicker) {
+    $("folderDescription").textContent =
+      "This browser does not support direct folder access. Try a recent desktop Chrome or Edge browser.";
+  }
 
 })();
