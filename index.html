@@ -1,6 +1,5 @@
-
 <!DOCTYPE html>
-<html lang="fr">
+<html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -16,7 +15,7 @@
       <span class="brand-mark">J</span>
       <div>
         <strong>J.A.R.V.I.S.</strong>
-        <small>QUEST EDITION / V0.1</small>
+        <small>QUEST EDITION / V0.2</small>
       </div>
     </div>
 
@@ -25,7 +24,7 @@
       <span id="connectionLabel">SYSTEM READY</span>
     </div>
 
-    <button class="icon-btn" id="settingsButton">⚙</button>
+    <button class="icon-btn" id="settingsButton" title="Settings">⚙</button>
   </header>
 
   <main class="dashboard">
@@ -34,7 +33,7 @@
       <div class="hero-copy">
         <p class="eyebrow">PERSONAL AI INTERFACE</p>
         <h1>Good evening.</h1>
-        <p class="muted">All local systems operational.</p>
+        <p class="muted">Your personal workspace is ready.</p>
 
         <div class="hero-actions">
           <button class="primary-btn" id="focusChat">
@@ -59,7 +58,7 @@
       <div class="panel stat">
         <span class="stat-label">INTERFACE</span>
         <strong>ACTIVE</strong>
-        <small>Running locally</small>
+        <small>Running in browser</small>
       </div>
 
       <div class="panel stat">
@@ -69,9 +68,9 @@
       </div>
 
       <div class="panel stat">
-        <span class="stat-label">PROJECT STORAGE</span>
-        <strong>LOCAL</strong>
-        <small>Browser storage</small>
+        <span class="stat-label">PC WORKSPACE</span>
+        <strong id="workspaceStatus">DISCONNECTED</strong>
+        <small id="workspaceDescription">No folder authorized</small>
       </div>
     </section>
 
@@ -90,14 +89,14 @@
           <article class="message assistant">
             <div class="message-tag">JARVIS</div>
             <div class="message-body">
-              Good evening. I am ready. Please configure your Groq API key in settings.
+              Good evening. I am ready. Configure your Groq API key in settings and connect a workspace folder to let me manage your projects.
             </div>
           </article>
         </div>
 
         <div class="voice-row">
           <button class="secondary-btn mic-btn" id="voiceButton">
-            🎙 VOICE INPUT
+            🎙 START CONTINUOUS LISTENING
           </button>
 
           <label class="toggle">
@@ -137,6 +136,45 @@
           <button class="text-btn" id="newProject">+ NEW</button>
         </div>
 
+        <div class="folder-access">
+          <div class="folder-access-heading">
+            <div>
+              <span class="folder-icon">📁</span>
+              <strong>PC FILE ACCESS</strong>
+            </div>
+            <span class="permission-badge" id="folderPermissionBadge">NOT CONNECTED</span>
+          </div>
+
+          <p id="folderDescription">
+            Authorize a folder to let JARVIS create, read and edit files inside it.
+          </p>
+
+          <div class="folder-actions">
+            <button class="primary-btn" id="connectFolder">
+              CONNECT PC FOLDER
+            </button>
+            <button class="secondary-btn" id="disconnectFolder" disabled>
+              DISCONNECT
+            </button>
+          </div>
+
+          <div class="folder-path" id="folderPath">No folder selected</div>
+        </div>
+
+        <div class="file-browser">
+          <div class="file-browser-heading">
+            <span>AUTHORIZED FILES</span>
+            <button class="text-btn" id="refreshFiles">↻ REFRESH</button>
+          </div>
+          <div class="file-tree" id="fileTree">
+            <div class="empty-state">
+              Connect a folder to browse its files.
+            </div>
+          </div>
+        </div>
+
+        <div class="project-divider"></div>
+
         <div class="project-list" id="projectList"></div>
 
         <div class="editor">
@@ -152,22 +190,37 @@
           <textarea
             id="codeEditor"
             spellcheck="false"
-            placeholder="// Your project code will appear here."
+            placeholder="// Select a project or a file from your PC."
           ></textarea>
 
           <div class="editor-bottom">
             <button class="secondary-btn" id="saveCode">
-              SAVE LOCALLY
+              SAVE
             </button>
-            <span id="saveStatus">LOCAL STORAGE</span>
+            <button class="secondary-btn" id="runPreview" disabled>
+              ▶ PREVIEW
+            </button>
+            <span id="saveStatus">READY</span>
           </div>
+        </div>
+
+        <div class="preview-section">
+          <div class="file-browser-heading">
+            <span>PROJECT PREVIEW</span>
+            <span id="previewStatus">IDLE</span>
+          </div>
+          <iframe
+            id="projectPreview"
+            title="JARVIS project preview"
+            sandbox="allow-scripts"
+          ></iframe>
         </div>
       </section>
 
     </section>
 
     <footer>
-      J.A.R.V.I.S. QUEST EDITION · EXPERIMENTAL BUILD 0.1
+      J.A.R.V.I.S. QUEST EDITION · EXPERIMENTAL BUILD 0.2
     </footer>
   </main>
 
@@ -178,7 +231,7 @@
         <p class="eyebrow">CONFIGURATION</p>
         <h2>System settings</h2>
       </div>
-      <button class="icon-btn">✕</button>
+      <button class="icon-btn" aria-label="Close">✕</button>
     </form>
 
     <div class="settings-content">
@@ -191,17 +244,13 @@
       >
 
       <p class="field-help">
-        Your key is kept in browser session memory, not in the GitHub files.
+        Your key is kept in this browser session. It is not included in your GitHub files. Never share it.
       </p>
 
       <label for="modelSelect">AI model</label>
       <select id="modelSelect">
-        <option value="openai/gpt-oss-20b">
-          GPT OSS 20B
-        </option>
-        <option value="openai/gpt-oss-120b">
-          GPT OSS 120B
-        </option>
+        <option value="openai/gpt-oss-20b">GPT OSS 20B</option>
+        <option value="openai/gpt-oss-120b">GPT OSS 120B</option>
       </select>
 
       <label for="languageSelect">Voice language</label>
@@ -211,7 +260,7 @@
       </select>
 
       <label for="systemPrompt">JARVIS personality</label>
-      <textarea id="systemPrompt" rows="5">You are JARVIS, a calm, intelligent and highly capable personal AI assistant. You speak naturally and concisely. You help the user with technology, programming and everyday tasks. You are running on a Meta Quest headset. Never claim to control hardware or applications that you cannot access.</textarea>
+      <textarea id="systemPrompt" rows="5"></textarea>
 
       <div class="settings-actions">
         <button class="secondary-btn" id="testConnection" type="button">
@@ -226,8 +275,7 @@
       <p id="settingsStatus" class="field-help"></p>
 
       <p class="security-note">
-        ⚠ Never publish your API key. A browser application cannot guarantee
-        that an API key remains secret. Check your Groq account limits.
+        ⚠ A browser application cannot keep an API key completely secret. Do not publish your key. Folder access is limited to the folder you explicitly authorize.
       </p>
     </div>
   </dialog>
@@ -236,7 +284,7 @@
   <dialog id="projectDialog" class="settings-dialog">
     <form method="dialog" class="dialog-head">
       <h2>New project</h2>
-      <button class="icon-btn">✕</button>
+      <button class="icon-btn" aria-label="Close">✕</button>
     </form>
 
     <div class="settings-content">
