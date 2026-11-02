@@ -1,0 +1,254 @@
+
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#050b13">
+  <title>J.A.R.V.I.S. — Quest Edition</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="scanlines"></div>
+
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark">J</span>
+      <div>
+        <strong>J.A.R.V.I.S.</strong>
+        <small>QUEST EDITION / V0.1</small>
+      </div>
+    </div>
+
+    <div class="status">
+      <span class="status-dot"></span>
+      <span id="connectionLabel">SYSTEM READY</span>
+    </div>
+
+    <button class="icon-btn" id="settingsButton">⚙</button>
+  </header>
+
+  <main class="dashboard">
+
+    <section class="hero panel">
+      <div class="hero-copy">
+        <p class="eyebrow">PERSONAL AI INTERFACE</p>
+        <h1>Good evening.</h1>
+        <p class="muted">All local systems operational.</p>
+
+        <div class="hero-actions">
+          <button class="primary-btn" id="focusChat">
+            INITIALIZE CONVERSATION ↗
+          </button>
+          <button class="secondary-btn" id="fullscreenButton">
+            FULLSCREEN ⛶
+          </button>
+        </div>
+      </div>
+
+      <div class="reactor-wrap">
+        <div class="reactor outer"></div>
+        <div class="reactor middle"></div>
+        <div class="reactor inner"></div>
+        <div class="reactor-core"></div>
+        <span class="reactor-label">ARC / CORE</span>
+      </div>
+    </section>
+
+    <section class="stats-grid">
+      <div class="panel stat">
+        <span class="stat-label">INTERFACE</span>
+        <strong>ACTIVE</strong>
+        <small>Running locally</small>
+      </div>
+
+      <div class="panel stat">
+        <span class="stat-label">ARTIFICIAL INTELLIGENCE</span>
+        <strong id="aiStatus">OFFLINE</strong>
+        <small>Groq API</small>
+      </div>
+
+      <div class="panel stat">
+        <span class="stat-label">PROJECT STORAGE</span>
+        <strong>LOCAL</strong>
+        <small>Browser storage</small>
+      </div>
+    </section>
+
+    <section class="main-grid">
+
+      <section class="panel chat-panel" id="chatPanel">
+        <div class="panel-heading">
+          <div>
+            <p class="eyebrow">COMMUNICATION</p>
+            <h2>JARVIS Assistant</h2>
+          </div>
+          <button class="text-btn" id="clearChat">CLEAR</button>
+        </div>
+
+        <div class="chat-log" id="chatLog">
+          <article class="message assistant">
+            <div class="message-tag">JARVIS</div>
+            <div class="message-body">
+              Good evening. I am ready. Please configure your Groq API key in settings.
+            </div>
+          </article>
+        </div>
+
+        <div class="voice-row">
+          <button class="secondary-btn mic-btn" id="voiceButton">
+            🎙 VOICE INPUT
+          </button>
+
+          <label class="toggle">
+            <input type="checkbox" id="speakToggle" checked>
+            <span class="toggle-ui"></span>
+            <span>VOICE OUTPUT</span>
+          </label>
+        </div>
+
+        <div id="voiceHint" class="voice-hint">
+          Voice recognition depends on browser support.
+        </div>
+
+        <form class="composer" id="chatForm">
+          <textarea
+            id="promptInput"
+            rows="2"
+            placeholder="Speak to JARVIS..."
+          ></textarea>
+
+          <button class="send-btn" type="submit">➤</button>
+        </form>
+
+        <div class="chat-foot">
+          <span>GROQ API / INTERNET REQUIRED</span>
+          <span id="tokenNote">NO API KEY</span>
+        </div>
+      </section>
+
+      <section class="panel projects-panel">
+        <div class="panel-heading">
+          <div>
+            <p class="eyebrow">WORKSPACE</p>
+            <h2>Projects</h2>
+          </div>
+
+          <button class="text-btn" id="newProject">+ NEW</button>
+        </div>
+
+        <div class="project-list" id="projectList"></div>
+
+        <div class="editor">
+          <div class="editor-top">
+            <span id="editorName">No file selected</span>
+
+            <div>
+              <button class="text-btn" id="copyCode">COPY</button>
+              <button class="text-btn" id="downloadCode">EXPORT</button>
+            </div>
+          </div>
+
+          <textarea
+            id="codeEditor"
+            spellcheck="false"
+            placeholder="// Your project code will appear here."
+          ></textarea>
+
+          <div class="editor-bottom">
+            <button class="secondary-btn" id="saveCode">
+              SAVE LOCALLY
+            </button>
+            <span id="saveStatus">LOCAL STORAGE</span>
+          </div>
+        </div>
+      </section>
+
+    </section>
+
+    <footer>
+      J.A.R.V.I.S. QUEST EDITION · EXPERIMENTAL BUILD 0.1
+    </footer>
+  </main>
+
+  <!-- SETTINGS -->
+  <dialog id="settingsDialog" class="settings-dialog">
+    <form method="dialog" class="dialog-head">
+      <div>
+        <p class="eyebrow">CONFIGURATION</p>
+        <h2>System settings</h2>
+      </div>
+      <button class="icon-btn">✕</button>
+    </form>
+
+    <div class="settings-content">
+      <label for="apiKey">Groq API key</label>
+      <input
+        id="apiKey"
+        type="password"
+        autocomplete="off"
+        placeholder="gsk_..."
+      >
+
+      <p class="field-help">
+        Your key is kept in browser session memory, not in the GitHub files.
+      </p>
+
+      <label for="modelSelect">AI model</label>
+      <select id="modelSelect">
+        <option value="openai/gpt-oss-20b">
+          GPT OSS 20B
+        </option>
+        <option value="openai/gpt-oss-120b">
+          GPT OSS 120B
+        </option>
+      </select>
+
+      <label for="languageSelect">Voice language</label>
+      <select id="languageSelect">
+        <option value="en-US">English</option>
+        <option value="fr-FR">French</option>
+      </select>
+
+      <label for="systemPrompt">JARVIS personality</label>
+      <textarea id="systemPrompt" rows="5">You are JARVIS, a calm, intelligent and highly capable personal AI assistant. You speak naturally and concisely. You help the user with technology, programming and everyday tasks. You are running on a Meta Quest headset. Never claim to control hardware or applications that you cannot access.</textarea>
+
+      <div class="settings-actions">
+        <button class="secondary-btn" id="testConnection" type="button">
+          TEST CONNECTION
+        </button>
+
+        <button class="primary-btn" id="saveSettings" type="button">
+          SAVE SETTINGS
+        </button>
+      </div>
+
+      <p id="settingsStatus" class="field-help"></p>
+
+      <p class="security-note">
+        ⚠ Never publish your API key. A browser application cannot guarantee
+        that an API key remains secret. Check your Groq account limits.
+      </p>
+    </div>
+  </dialog>
+
+  <!-- NEW PROJECT -->
+  <dialog id="projectDialog" class="settings-dialog">
+    <form method="dialog" class="dialog-head">
+      <h2>New project</h2>
+      <button class="icon-btn">✕</button>
+    </form>
+
+    <div class="settings-content">
+      <label for="projectName">Project name</label>
+      <input id="projectName" maxlength="48" placeholder="My project">
+
+      <button class="primary-btn" id="createProject" type="button">
+        CREATE PROJECT
+      </button>
+    </div>
+  </dialog>
+
+  <script src="app.js"></script>
+</body>
+</html>
