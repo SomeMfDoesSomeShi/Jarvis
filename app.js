@@ -1,1456 +1,1087 @@
 (() => {
-  "use strict";
+"use strict";
 
-  const $ = id => document.getElementById(id);
-  const PROJECTS_KEY = "jarvis_projects_v1";
-  const SETTINGS_KEY = "jarvis_settings_v1";
-  const CHAT_URL = "https://api.groq.com/openai/v1/chat/completions";
-  const STT_URL = "https://api.groq.com/openai/v1/audio/transcriptions";
-  const TTS_URL = "https://api.groq.com/openai/v1/audio/speech";
+const $ = id => document.getElementById(id);
 
-  const DEFAULT_SYSTEM = `You are JARVIS, a calm, intelligent and highly capable personal AI assistant. Speak naturally and concisely. English is your primary language. You help with technology, programming, project creation and everyday tasks.
+const CHAT_URL = "https://api.groq.com/openai/v1/chat/completions";
+const WHISPER_URL = "https://api.groq.com/openai/v1/audio/transcriptions";
+const WIKI_URL = "https://en.wikipedia.org/w/rest.php/v1/search/page";
+const SETTINGS_KEY = "jarvis_cloud_settings_v1";
 
-You are running in a browser on a desktop computer or Meta Quest headset. You may use ONLY the user-authorized workspace folder through the tools provided by this application.
+const SYSTEM = `You are J.A.R.V.I.S., a concise, intelligent, proactive personal AI assistant. Be calm, polished, analytical and naturally conversational. Default to English; follow the user's language.
 
-AUTONOMOUS PROJECT CREATION:
-- When the user asks you to create, build, make, design or prototype a website, game, visualization or 3D scene, CREATE IT. Do not answer with tutorials or instructions instead of doing the work.
-- First inspect the workspace with list_files. Then create a sensible project folder and write all required files with write_file.
-- For a browser-based 3D scene, create a complete index.html. Prefer Three.js from its public CDN, with all scene logic in the HTML unless separate files are genuinely useful.
-- After writing the HTML, call preview_file with its relative path so the user sees the result immediately.
-- If the user asks for a simple 3D scene, make reasonable creative decisions and produce a working first version without asking unnecessary questions.
-- If no workspace is connected, explain that the user must connect a folder before you can create files. You may still explain the intended plan, but never claim a file was created.
-- After tool use, report only operations confirmed by successful tool results.
+You run inside a browser. You can write code, design complete web apps, games, visualizations and browser-based 3D scenes, analyze/debug code, and manage projects through the cloud workspace. You can search Wikipedia and speak through installed browser voices. You cannot run native programs, control the operating system or hardware, or access arbitrary PC files. Never claim an action succeeded unless the app confirms it.
 
-WORKSPACE RULES:
-- You can access files only inside the folder explicitly selected by the user. Never claim to access the rest of the PC.
-- Inspect existing files before modifying them. Existing files are backed up when possible.
-- Deleted files are moved to .jarvis-trash rather than permanently erased.
-- Never attempt shell commands or launch native PC programs.
-- HTML/CSS/JavaScript can be previewed in the browser. Native programs such as Python cannot automatically run through this static website.
-- Keep answers concise, useful and natural.`;
+SPECIAL RESPONSE PROTOCOL:
+1) Create a project: output [code Project Name] on the first line, then ONE fenced JSON block:
+{"files":{"index.html":"complete content","style.css":"complete content","app.js":"complete content"}}
+Include all necessary files. For small projects, prefer a self-contained index.html. The app saves the files to the cloud workspace, hides this intermediate response, then asks you for a normal confirmation. Do not add explanations outside the JSON block.
 
-  let apiKey = sessionStorage.getItem("jarvis_groq_key") || "";
-  let history = [];
-  let settings = loadJSON(SETTINGS_KEY, {
-    model: "openai/gpt-oss-20b",
-    language: "en-US",
-    systemPrompt: DEFAULT_SYSTEM
-  });
-  let projects = loadJSON(PROJECTS_KEY, []);
-  let activeProjectId = null;
-  let busy = false;
-  let requestQueue = [];
-  let processingQueue = false;
+2) Load a project: output only [read code Project Name]. The app supplies its files privately, then asks you to continue normally.
 
-  // Voice capture: MediaRecorder + Groq Whisper.
-  let listening = false;
-  let micStream = null;
-  let mediaRecorder = null;
-  let audioContext = null;
-  let analyser = null;
-  let micAnimation = 0;
-  let recordingChunks = [];
-  let recordingStartedAt = 0;
-  let lastVoiceAt = 0;
-  let speechDetected = false;
-  let transcriptionBusy = false;
-  let speaking = false;
-  let speechQueue = [];
-  let speechQueueRunning = false;
-  let currentAudio = null;
-  let currentAudioUrl = null;
+3) Search: output only [search on internet search terms]. The app searches Wikipedia and supplies results privately. Answer using those results and explain if they are insufficient.
 
-  // Authorized workspace.
-  let workspaceHandle = null;
-  let activeFilePath = null;
-  let activeFileHandle = null;
+Never show these markers in ordinary replies. Do not claim to search the entire Internet. Prefer creating project files over pasting huge code into chat.`;
 
-  function loadJSON(key, fallback) {
-    try {
-      return JSON.parse(localStorage.getItem(key)) ?? fallback;
-    } catch {
-      return fallback;
-    }
+let cfg = loadSettings();
+let db = null;
+let user = null;
+let projects = [];
+let active = null;
+let file = null;
+let history = [];
+let busy = false;
+let actionHistoryHandled = false;
+let recognition = null;
+let recorder = null;
+let stream = null;
+let chunks = [];
+let listening = false;
+
+function loadSettings() {
+  try {
+    return {
+      groq: "",
+      model: "openai/gpt-oss-20b",
+      url: "",
+      anon: "",
+      ...JSON.parse(localStorage.getItem(SETTINGS_KEY) || "{}")
+    };
+  } catch {
+    return {groq:"",model:"openai/gpt-oss-20b",url:"",anon:""};
+  }
+}
+
+function saveSettings() {
+  localStorage.setItem(SETTINGS_KEY, JSON.stringify(cfg));
+}
+
+function escapeHTML(value) {
+  return String(value).replace(/[&<>"']/g, c => ({
+    "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"
+  }[c]));
+}
+
+function setStatus(text, ok = true) {
+  $("systemState").innerHTML = "<i></i> " + escapeHTML(text);
+  $("systemState").style.color = ok ? "var(--green)" : "var(--red)";
+}
+
+function setSync(text) {
+  $("syncStatus").textContent = text;
+}
+
+function addMessage(role, text, formatted = false) {
+  const wrapper = document.createElement("div");
+  wrapper.className = "message " + role;
+
+  const speaker = document.createElement("div");
+  speaker.className = "speaker";
+  speaker.textContent = role === "assistant" ? "J.A.R.V.I.S." : "YOU";
+
+  const bubble = document.createElement("div");
+  bubble.className = "bubble";
+
+  if (formatted) {
+    bubble.innerHTML = escapeHTML(text)
+      .replace(/```([\s\S]*?)```/g, "<pre><code>$1</code></pre>")
+      .replace(/`([^`]+)`/g, "<code>$1</code>")
+      .replace(/\*\*(.*?)\*\*/g, "<strong>$1</strong>");
+  } else {
+    bubble.textContent = text;
   }
 
-  function saveJSON(key, value) {
-    try {
-      localStorage.setItem(key, JSON.stringify(value));
-      return true;
-    } catch (error) {
-      console.error("Storage error:", error);
-      alert("Local storage error: " + error.message);
-      return false;
-    }
+  wrapper.append(speaker, bubble);
+  $("chatLog").append(wrapper);
+  $("chatLog").scrollTop = $("chatLog").scrollHeight;
+}
+
+function setBusy(value) {
+  busy = value;
+  $("sendButton").disabled = value;
+  $("aiState").textContent = value ? "PROCESSING" : "STANDBY";
+}
+
+/* ---------------- SUPABASE ---------------- */
+
+function initializeDatabase() {
+  db = null;
+  user = null;
+
+  if (!cfg.url || !cfg.anon || !window.supabase?.createClient) {
+    renderAuth();
+    return;
   }
 
-  function setStatus(message, success = true) {
-    $("connectionLabel").textContent = message;
-    $("connectionLabel").style.color = success ? "var(--green)" : "#ff7777";
-  }
+  try {
+    db = window.supabase.createClient(cfg.url, cfg.anon);
 
-  function setBusy(value) {
-    busy = value;
-    const button = document.querySelector("#chatForm button[type='submit']");
+    db.auth.onAuthStateChange((_event, session) => {
+      user = session?.user || null;
+      renderAuth();
 
-    if (button) {
-      button.disabled = value;
-      button.style.opacity = value ? ".5" : "1";
-    }
-
-    $("aiStatus").textContent = value ? "PROCESSING" : apiKey ? "READY" : "OFFLINE";
-  }
-
-  function addMessage(role, content, formatted = false) {
-    const article = document.createElement("article");
-    article.className = "message " + role;
-
-    const tag = document.createElement("div");
-    tag.className = "message-tag";
-    tag.textContent = role === "assistant" ? "JARVIS" : "YOU";
-
-    const body = document.createElement("div");
-    body.className = "message-body";
-
-    if (formatted) {
-      const escaped = String(content).replace(/[&<>"']/g, c => ({
-        "&": "&amp;",
-        "<": "&lt;",
-        ">": "&gt;",
-        '"': "&quot;",
-        "'": "&#39;"
-      })[c]);
-
-      body.innerHTML = escaped
-        .replace(/```([\s\S]*?)```/g, "<pre><code>$1</code></pre>")
-        .replace(/`([^`]+)`/g, "<code>$1</code>");
-    } else {
-      body.textContent = content;
-    }
-
-    article.append(tag, body);
-    $("chatLog").appendChild(article);
-    $("chatLog").scrollTop = $("chatLog").scrollHeight;
-  }
-
-  function normalizeText(text) {
-    return String(text)
-      .toLowerCase()
-      .replace(/[^\p{L}\p{N}\s]/gu, "")
-      .replace(/\s+/g, " ")
-      .trim();
-  }
-
-  // ---------------- VOICE OUTPUT: GROQ ORPHEUS ----------------
-
-  function splitForTTS(text, max = 185) {
-    const clean = String(text)
-      .replace(/```[\s\S]*?```/g, "Code omitted.")
-      .replace(/`([^`]+)`/g, "$1")
-      .replace(/https?:\/\/\S+/g, "link")
-      .replace(/\s+/g, " ")
-      .trim();
-
-    const sentences = clean.match(/[^.!?]+[.!?]+|[^.!?]+$/g) || [clean];
-    const chunks = [];
-    let current = "";
-
-    for (const sentence of sentences) {
-      const s = sentence.trim();
-
-      if (!s) continue;
-
-      if ((current + " " + s).trim().length <= max) {
-        current = (current + " " + s).trim();
-        continue;
+      if (user) loadProjects().catch(cloudError);
+      else {
+        projects = [];
+        active = null;
+        renderProjects();
+        clearEditor();
       }
-
-      if (current) chunks.push(current);
-
-      if (s.length <= max) {
-        current = s;
-      } else {
-        let rest = s;
-
-        while (rest.length > max) {
-          let cut = rest.lastIndexOf(" ", max);
-
-          if (cut < 60) cut = max;
-
-          chunks.push(rest.slice(0, cut).trim());
-          rest = rest.slice(cut).trim();
-        }
-
-        current = rest;
-      }
-    }
-
-    if (current) chunks.push(current);
-
-    return chunks;
-  }
-
-  function stopSpeaking() {
-    speechQueue = [];
-    speechQueueRunning = false;
-    speaking = false;
-
-    if (currentAudio) {
-      currentAudio.pause();
-      currentAudio.src = "";
-      currentAudio = null;
-    }
-
-    if (currentAudioUrl) {
-      URL.revokeObjectURL(currentAudioUrl);
-      currentAudioUrl = null;
-    }
-
-    if (listening) {
-      $("voiceHint").textContent = "Listening continuously...";
-    }
-  }
-
-  async function generateSpeech(text) {
-    const response = await fetch(TTS_URL, {
-      method: "POST",
-      headers: {
-        Authorization: "Bearer " + apiKey,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({
-        model: "canopylabs/orpheus-v1-english",
-        voice: "troy",
-        input: text,
-        response_format: "wav"
-      })
     });
 
-    if (!response.ok) {
-      const data = await response.json().catch(() => ({}));
-      throw new Error(data?.error?.message || "TTS HTTP " + response.status);
-    }
+    db.auth.getSession().then(({data,error}) => {
+      if (error) throw error;
 
-    return await response.blob();
+      user = data.session?.user || null;
+      renderAuth();
+
+      if (user) loadProjects().catch(cloudError);
+    }).catch(cloudError);
+
+  } catch (error) {
+    $("authStatus").textContent = error.message;
+    renderAuth();
+  }
+}
+
+function renderAuth() {
+  const connected = !!user;
+
+  $("authPanel").classList.toggle("hidden", connected);
+  $("accountPanel").classList.toggle("hidden", !connected);
+
+  $("cloudBadge").textContent = connected ? "CLOUD SYNC ACTIVE" : "NOT CONNECTED";
+  $("cloudBadge").classList.toggle("muted", !connected);
+  $("accountEmail").textContent = user?.email || "";
+
+  if (!connected) {
+    $("authStatus").textContent = db
+      ? "Sign in or create an account."
+      : "Enter Supabase URL and public key in Settings.";
+
+    setStatus("OFFLINE", false);
+  } else {
+    setStatus("CLOUD ONLINE");
+  }
+}
+
+async function authenticate(mode) {
+  if (!db) {
+    $("settingsDialog").showModal();
+    $("authStatus").textContent = "Configure Supabase first.";
+    return;
   }
 
-  async function runSpeechQueue() {
-    if (speechQueueRunning) return;
+  const email = $("authEmail").value.trim();
+  const password = $("authPassword").value;
 
-    speechQueueRunning = true;
-    speaking = true;
+  if (!email || password.length < 6) {
+    throw Error("Enter an email and password of at least 6 characters.");
+  }
 
+  $("authStatus").textContent = "Connecting...";
+
+  const result = mode === "signup"
+    ? await db.auth.signUp({email,password})
+    : await db.auth.signInWithPassword({email,password});
+
+  if (result.error) throw result.error;
+
+  if (mode === "signup" && !result.data.session) {
+    $("authStatus").textContent =
+      "Account created. Confirm your email, then sign in.";
+  } else {
+    user = result.data.user || result.data.session?.user;
+    renderAuth();
+    await loadProjects();
+  }
+}
+
+async function signOut() {
+  if (db) await db.auth.signOut();
+
+  user = null;
+  projects = [];
+  active = null;
+  file = null;
+  history = [];
+
+  renderAuth();
+  renderProjects();
+  clearEditor();
+}
+
+async function loadProjects() {
+  if (!db || !user) return;
+
+  setSync("Syncing...");
+
+  const {data,error} = await db
+    .from("jarvis_projects")
+    .select("id,name,files,created_at,updated_at")
+    .order("updated_at",{ascending:false});
+
+  if (error) throw error;
+
+  projects = data || [];
+  renderProjects();
+
+  setSync(`${projects.length} project(s) synced`);
+  setStatus("CLOUD ONLINE");
+}
+
+function renderProjects() {
+  const box = $("projectList");
+  box.replaceChildren();
+
+  if (!user) {
+    box.innerHTML = '<div class="empty">Sign in to load cloud projects.</div>';
+    return;
+  }
+
+  if (!projects.length) {
+    box.innerHTML = '<div class="empty">No projects yet.</div>';
+    return;
+  }
+
+  for (const project of projects) {
+    const row = document.createElement("div");
+    row.className = "project-row";
+
+    const select = document.createElement("button");
+    select.className = "project-select" +
+      (active?.id === project.id ? " active" : "");
+    select.textContent = project.name;
+    select.onclick = () => showProject(project);
+
+    const remove = document.createElement("button");
+    remove.className = "project-mini";
+    remove.textContent = "×";
+    remove.title = "Delete project";
+    remove.onclick = () => deleteProject(project.id);
+
+    row.append(select,remove);
+    box.append(row);
+  }
+}
+
+/* ---------------- PROJECT FILES ---------------- */
+
+function normalizeFiles(files) {
+  const result = {};
+
+  for (const [name,content] of Object.entries(files || {})) {
+    const path = String(name).replace(/\\/g,"/").replace(/^\/+/,"");
+
+    if (!path || path.split("/").some(x => x === ".." || x === ".")) {
+      continue;
+    }
+
+    result[path] = String(content);
+  }
+
+  return result;
+}
+
+async function saveProject(name,files,id = null) {
+  if (!db || !user) {
+    throw Error("Sign in to the cloud workspace first.");
+  }
+
+  const payload = {
+    user_id:user.id,
+    name:String(name).trim().slice(0,80),
+    files:normalizeFiles(files),
+    updated_at:new Date().toISOString()
+  };
+
+  if (!payload.name) throw Error("Project name is empty.");
+
+  const result = id
+    ? await db.from("jarvis_projects")
+        .update(payload).eq("id",id).select().single()
+    : await db.from("jarvis_projects")
+        .insert(payload).select().single();
+
+  if (result.error) throw result.error;
+
+  const index = projects.findIndex(p => p.id === result.data.id);
+
+  if (index < 0) projects.unshift(result.data);
+  else projects[index] = result.data;
+
+  showProject(result.data);
+  setSync("Saved to cloud ✓");
+
+  return result.data;
+}
+
+function clearEditor() {
+  $("editorTitle").textContent = "No project selected";
+  $("fileSelect").innerHTML = "<option>No file</option>";
+  $("fileSelect").disabled = true;
+  $("codeEditor").value = "";
+  $("codeEditor").disabled = true;
+
+  ["saveFile","previewFile","downloadProject"].forEach(id => {
+    $(id).disabled = true;
+  });
+
+  $("editorStatus").textContent = "Cloud files are stored in your account.";
+}
+
+function showProject(project) {
+  active = project;
+
+  const files = normalizeFiles(project.files);
+  const names = Object.keys(files).sort();
+
+  $("editorTitle").textContent = project.name;
+  $("fileSelect").replaceChildren();
+
+  for (const name of names) {
+    const option = document.createElement("option");
+    option.value = name;
+    option.textContent = name;
+    $("fileSelect").append(option);
+  }
+
+  $("fileSelect").disabled = !names.length;
+  $("codeEditor").disabled = !names.length;
+  $("saveFile").disabled = !names.length;
+
+  $("previewFile").disabled =
+    !names.some(name => name.toLowerCase().endsWith(".html"));
+
+  $("downloadProject").disabled = false;
+
+  file = names.includes("index.html") ? "index.html" : names[0] || null;
+
+  if (file) {
+    $("fileSelect").value = file;
+    $("codeEditor").value = files[file];
+  } else {
+    $("codeEditor").value = "";
+  }
+
+  $("editorStatus").textContent =
+    `${names.length} file(s) · Cloud project`;
+
+  renderProjects();
+}
+
+function changeFile() {
+  if (!active) return;
+
+  file = $("fileSelect").value;
+  $("codeEditor").value = normalizeFiles(active.files)[file] || "";
+}
+
+async function saveCurrentFile() {
+  if (!active || !file) return;
+
+  const files = normalizeFiles(active.files);
+  files[file] = $("codeEditor").value;
+
+  await saveProject(active.name,files,active.id);
+
+  $("editorStatus").textContent = `Saved ${file} to cloud ✓`;
+}
+
+async function deleteProject(id) {
+  const project = projects.find(p => p.id === id);
+
+  if (!project || !confirm(`Delete "${project.name}" from cloud?`)) {
+    return;
+  }
+
+  const {error} = await db
+    .from("jarvis_projects")
+    .delete()
+    .eq("id",id);
+
+  if (error) throw error;
+
+  projects = projects.filter(p => p.id !== id);
+
+  if (active?.id === id) {
+    active = null;
+    file = null;
+    clearEditor();
+  }
+
+  renderProjects();
+  setSync("Deleted from cloud");
+}
+
+/* ---------------- HTML PREVIEW ---------------- */
+
+function previewProject() {
+  if (!active) return;
+
+  const files = normalizeFiles(active.files);
+
+  if (file) files[file] = $("codeEditor").value;
+
+  const htmlName =
+    Object.keys(files).find(x => x.toLowerCase() === "index.html") ||
+    Object.keys(files).find(x => x.toLowerCase().endsWith(".html"));
+
+  if (!htmlName) {
+    $("previewStatus").textContent = "NO HTML FILE";
+    return;
+  }
+
+  let html = files[htmlName];
+
+  for (const [name,content] of Object.entries(files)) {
+    if (name.endsWith(".css")) {
+      const escaped = name.replace(/[.*+?^${}()|[\]\\]/g,"\\$&");
+      const regex = new RegExp(
+        `<link([^>]+)href=["']${escaped}["']([^>]*)>`,
+        "gi"
+      );
+
+      html = html.replace(regex,`<style>${content}</style>`);
+    }
+
+    if (name.endsWith(".js")) {
+      const escaped = name.replace(/[.*+?^${}()|[\]\\]/g,"\\$&");
+      const regex = new RegExp(
+        `<script([^>]+)src=["']${escaped}["']([^>]*)><\\/script>`,
+        "gi"
+      );
+
+      html = html.replace(regex,`<script>${content}<\/script>`);
+    }
+  }
+
+  $("previewFrame").srcdoc = html;
+  $("previewStatus").textContent = "PREVIEW: " + htmlName;
+}
+
+/* ---------------- ZIP IMPORT / EXPORT ---------------- */
+
+function safeFilename(name) {
+  return String(name).normalize("NFKD")
+    .replace(/[^\w.-]+/g,"-").slice(0,70) || "jarvis-project";
+}
+
+function downloadBlob(blob,name) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+
+  a.href = url;
+  a.download = name;
+  document.body.append(a);
+  a.click();
+  a.remove();
+
+  setTimeout(() => URL.revokeObjectURL(url),1500);
+}
+
+async function exportProject(project = active) {
+  if (!project) throw Error("Select a project first.");
+  if (!window.JSZip) throw Error("ZIP library unavailable.");
+
+  const zip = new JSZip();
+
+  for (const [name,content] of Object.entries(normalizeFiles(project.files))) {
+    zip.file(name,content);
+  }
+
+  zip.file("jarvis-project.json",JSON.stringify({
+    format:"jarvis-cloud-project",
+    version:1,
+    name:project.name,
+    exportedAt:new Date().toISOString()
+  },null,2));
+
+  const blob = await zip.generateAsync({type:"blob"});
+
+  downloadBlob(blob,safeFilename(project.name)+".zip");
+}
+
+async function importProject(zipFile) {
+  if (!user) throw Error("Sign in before importing.");
+  if (!window.JSZip) throw Error("ZIP library unavailable.");
+
+  const zip = await JSZip.loadAsync(zipFile);
+  const files = {};
+
+  for (const [name,entry] of Object.entries(zip.files)) {
+    if (
+      entry.dir ||
+      name === "jarvis-project.json" ||
+      name.startsWith("__MACOSX/") ||
+      name.split("/").includes("..")
+    ) continue;
+
+    files[name] = await entry.async("string");
+  }
+
+  if (!Object.keys(files).length) {
+    throw Error("No readable files in ZIP.");
+  }
+
+  let name = zipFile.name.replace(/\.zip$/i,"");
+
+  if (zip.files["jarvis-project.json"]) {
     try {
-      while (speechQueue.length) {
-        const chunk = speechQueue.shift();
-
-        if (!$("speakToggle").checked) break;
-
-        if (settings.language !== "en-US") {
-          $("voiceHint").textContent = "Neural voice currently supports English only. Set voice language to English.";
-          break;
-        }
-
-        $("voiceHint").textContent = "JARVIS generating voice...";
-
-        const blob = await generateSpeech(chunk);
-
-        if (!$("speakToggle").checked) break;
-
-        currentAudioUrl = URL.createObjectURL(blob);
-        currentAudio = new Audio(currentAudioUrl);
-        currentAudio.preload = "auto";
-
-        $("voiceHint").textContent = "JARVIS speaking...";
-
-        await new Promise((resolve, reject) => {
-          currentAudio.onended = resolve;
-
-          currentAudio.onerror = () => reject(
-            new Error("The generated audio could not be played by this browser.")
-          );
-
-          const p = currentAudio.play();
-
-          if (p?.catch) p.catch(reject);
-        });
-
-        currentAudio = null;
-        URL.revokeObjectURL(currentAudioUrl);
-        currentAudioUrl = null;
-      }
-    } catch (error) {
-      console.error("Neural TTS error:", error);
-      $("voiceHint").textContent = "Voice generation failed: " + error.message;
-    } finally {
-      speechQueueRunning = false;
-      speaking = false;
-
-      if (listening && !transcriptionBusy) {
-        $("voiceHint").textContent = "Listening continuously...";
-      }
-    }
-  }
-
-  function speak(text) {
-    if (!$("speakToggle").checked || !apiKey) return;
-
-    stopSpeaking();
-    speechQueue = splitForTTS(text);
-
-    if (speechQueue.length) runSpeechQueue();
-  }
-
-  // ---------------- WORKSPACE FILE SYSTEM ----------------
-
-  function requireWorkspace() {
-    if (!workspaceHandle) {
-      throw new Error("No workspace folder is connected. Connect a folder first.");
-    }
-  }
-
-  function validatePath(path) {
-    if (typeof path !== "string") {
-      throw new Error("Invalid file path.");
-    }
-
-    const normalized = path.replace(/\\/g, "/").trim();
-
-    if (normalized.startsWith("/") || /^[a-zA-Z]:/.test(normalized)) {
-      throw new Error("Absolute paths are not allowed.");
-    }
-
-    const parts = normalized.split("/").filter(Boolean);
-
-    if (parts.some(p => p === "." || p === ".." || p.includes("\0"))) {
-      throw new Error("This path is not allowed.");
-    }
-
-    if (parts.some(p => p === ".jarvis-backups" || p === ".jarvis-trash")) {
-      throw new Error("JARVIS internal folders cannot be modified directly.");
-    }
-
-    return parts;
-  }
-
-  async function getDirectory(parts, create = false) {
-    requireWorkspace();
-
-    let dir = workspaceHandle;
-
-    for (const part of parts) {
-      dir = await dir.getDirectoryHandle(part, { create });
-    }
-
-    return dir;
-  }
-
-  async function getFileHandle(path, create = false) {
-    const parts = validatePath(path);
-
-    if (!parts.length) {
-      throw new Error("A file path is required.");
-    }
-
-    const parent = await getDirectory(parts.slice(0, -1), create);
-
-    return parent.getFileHandle(parts.at(-1), { create });
-  }
-
-  async function readWorkspaceFile(path) {
-    const handle = await getFileHandle(path);
-    const file = await handle.getFile();
-
-    if (file.size > 2_000_000) {
-      throw new Error("This file is larger than 2 MB.");
-    }
-
-    return file.text();
-  }
-
-  async function writeWorkspaceFile(path, content) {
-    requireWorkspace();
-
-    if (typeof content !== "string") {
-      throw new Error("File content must be text.");
-    }
-
-    if (content.length > 1_500_000) {
-      throw new Error("This file is too large.");
-    }
-
-    const parts = validatePath(path);
-
-    if (!parts.length) {
-      throw new Error("A file path is required.");
-    }
-
-    const filename = parts.at(-1);
-    const parent = await getDirectory(parts.slice(0, -1), true);
-
-    let existing = null;
-
-    try {
-      existing = await parent.getFileHandle(filename);
+      const metadata = JSON.parse(
+        await zip.files["jarvis-project.json"].async("string")
+      );
+      name = metadata.name || name;
     } catch {}
-
-    if (existing) {
-      const old = await existing.getFile();
-
-      if (old.size <= 1_500_000) {
-        const backupDir = await getDirectory([".jarvis-backups"], true);
-        const stamp = new Date().toISOString().replace(/[:.]/g, "-");
-
-        const backup = await backupDir.getFileHandle(
-          filename + "." + stamp + ".bak",
-          { create: true }
-        );
-
-        const bw = await backup.createWritable();
-        await bw.write(await old.arrayBuffer());
-        await bw.close();
-      }
-    }
-
-    const handle = await parent.getFileHandle(filename, { create: true });
-    const writer = await handle.createWritable();
-
-    await writer.write(content);
-    await writer.close();
-
-    return `Successfully saved ${path}.`;
   }
 
-  async function listWorkspaceFolder(path = "") {
-    requireWorkspace();
+  await saveProject(name,files);
+}
 
-    const parts = validatePath(path);
-    const dir = await getDirectory(parts);
-    const entries = [];
+/* ---------------- AI SPECIAL COMMANDS ---------------- */
 
-    for await (const [name, handle] of dir.entries()) {
-      if (parts.length === 0 && [".jarvis-backups", ".jarvis-trash"].includes(name)) {
-        continue;
-      }
+function parseCodeResponse(text) {
+  const match = text.match(/^\s*\[code\s+([^\]]+)\]\s*/i);
+  if (!match) return null;
 
-      entries.push({
-        name,
-        kind: handle.kind,
-        path: [...parts, name].join("/")
-      });
+  const name = match[1].trim();
+  const body = text.slice(match[0].length).trim();
+
+  const jsonMatch = body.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  const candidate = jsonMatch ? jsonMatch[1].trim() : body;
+
+  let files = null;
+
+  try {
+    const parsed = JSON.parse(candidate);
+
+    if (parsed.files && typeof parsed.files === "object") {
+      files = normalizeFiles(parsed.files);
     }
+  } catch {}
 
-    entries.sort((a, b) =>
-      a.kind !== b.kind
-        ? (a.kind === "directory" ? -1 : 1)
-        : a.name.localeCompare(b.name)
+  if (!files) {
+    const codeMatch = body.match(
+      /```([a-zA-Z0-9+#.-]*)\s*([\s\S]*?)```/
     );
 
-    return entries;
-  }
+    if (codeMatch) {
+      const extensions = {
+        html:"html",css:"css",js:"js",javascript:"js",
+        python:"py",py:"py",json:"json",cpp:"cpp",arduino:"ino"
+      };
 
-  async function createWorkspaceDirectory(path) {
-    const parts = validatePath(path);
+      const ext = extensions[codeMatch[1].toLowerCase()] || "txt";
+      const filename = ext === "html" ? "index.html" : "main."+ext;
 
-    if (!parts.length) {
-      throw new Error("A directory path is required.");
-    }
-
-    await getDirectory(parts, true);
-    await refreshFileTree();
-
-    return `Directory created: ${path}`;
-  }
-
-  async function moveFileToTrash(path) {
-    const parts = validatePath(path);
-
-    if (!parts.length) {
-      throw new Error("Invalid file path.");
-    }
-
-    const filename = parts.at(-1);
-    const source = await getFileHandle(path);
-    const file = await source.getFile();
-    const trash = await getDirectory([".jarvis-trash"], true);
-    const stamp = new Date().toISOString().replace(/[:.]/g, "-");
-
-    const target = await trash.getFileHandle(
-      filename + "." + stamp + ".deleted",
-      { create: true }
-    );
-
-    const writer = await target.createWritable();
-
-    await writer.write(await file.arrayBuffer());
-    await writer.close();
-
-    await (await getDirectory(parts.slice(0, -1))).removeEntry(filename);
-    await refreshFileTree();
-
-    return `${path} moved to .jarvis-trash. It was not permanently deleted.`;
-  }
-
-  // ---------------- FILE EXPLORER ----------------
-
-  async function refreshFileTree() {
-    const tree = $("fileTree");
-
-    if (!workspaceHandle) {
-      tree.innerHTML = '<div class="empty-state">Connect a folder to browse its files.</div>';
-      return;
-    }
-
-    tree.replaceChildren();
-
-    async function renderInto(container, path, depth) {
-      const entries = await listWorkspaceFolder(path);
-
-      for (const entry of entries) {
-        const button = document.createElement("button");
-
-        button.className = "file-entry " +
-          (entry.kind === "directory" ? "directory" : "file");
-
-        button.style.paddingLeft = `${7 + depth * 15}px`;
-
-        const icon = document.createElement("span");
-        icon.textContent = entry.kind === "directory" ? "📁" : "📄";
-
-        const name = document.createElement("span");
-        name.className = "file-name";
-        name.textContent = entry.name;
-
-        button.append(icon, name);
-        container.appendChild(button);
-
-        if (entry.kind === "file") {
-          button.addEventListener("click", () => openWorkspaceFile(entry.path));
-        } else {
-          button.addEventListener("click", async () => {
-            const selector = `[data-folder="${CSS.escape(entry.path)}"]`;
-            const found = container.querySelector(selector);
-
-            if (found) {
-              found.remove();
-              return;
-            }
-
-            const holder = document.createElement("div");
-            holder.dataset.folder = entry.path;
-            button.after(holder);
-
-            try {
-              await renderInto(holder, entry.path, depth + 1);
-            } catch (e) {
-              holder.textContent = e.message;
-            }
-          });
-        }
-      }
-    }
-
-    await renderInto(tree, "", 0);
-
-    if (!tree.children.length) {
-      tree.innerHTML = '<div class="empty-state">This folder is empty.</div>';
+      files = {[filename]:codeMatch[2].trim()};
     }
   }
 
-  async function openWorkspaceFile(path) {
-    try {
-      const handle = await getFileHandle(path);
-      const file = await handle.getFile();
+  return {name,files:files || {}};
+}
 
-      if (file.size > 2_000_000) {
-        throw new Error("This file is too large to open in the editor.");
-      }
+function parseDirective(text) {
+  let match = text.match(/^\s*\[read code\s+([^\]]+)\]\s*$/i);
 
-      activeFilePath = path;
-      activeFileHandle = handle;
-      activeProjectId = null;
-
-      $("editorName").textContent = path;
-      $("codeEditor").value = await file.text();
-      $("saveStatus").textContent = "PC FILE OPENED";
-      $("runPreview").disabled = !path.toLowerCase().endsWith(".html");
-
-      document.querySelectorAll(".file-entry").forEach(el => {
-        el.classList.remove("active");
-      });
-
-      const match = [...document.querySelectorAll(".file-entry")]
-        .find(el => el.textContent.trim() === path.split("/").at(-1));
-
-      match?.classList.add("active");
-    } catch (error) {
-      addMessage("assistant", "I couldn't open that file: " + error.message);
-    }
+  if (match) {
+    return {type:"read",name:match[1].trim()};
   }
 
-  async function saveActiveFile() {
-    if (activeFilePath) {
-      await writeWorkspaceFile(activeFilePath, $("codeEditor").value);
-      $("saveStatus").textContent = "PC FILE SAVED ✓";
-      await refreshFileTree();
-    } else {
-      saveCode();
-    }
+  match = text.match(/^\s*\[search on internet\s+([^\]]+)\]\s*$/i);
+
+  if (match) {
+    return {type:"search",query:match[1].trim()};
   }
 
-  // ---------------- PREVIEW ----------------
+  return null;
+}
 
-  async function previewHtmlFile(path) {
-    if (!path.toLowerCase().endsWith(".html")) {
-      throw new Error("Only HTML files can be previewed.");
-    }
+function findProject(name) {
+  return projects.find(p => p.name.toLowerCase() === name.toLowerCase()) ||
+    projects.find(p => p.name.toLowerCase().includes(name.toLowerCase()));
+}
 
-    const html = await readWorkspaceFile(path);
+async function searchWikipedia(query) {
+  const response = await fetch(
+    `${WIKI_URL}?q=${encodeURIComponent(query)}&limit=6`
+  );
 
-    $("projectPreview").srcdoc = html;
-    $("previewStatus").textContent = "PREVIEW: " + path;
+  if (!response.ok) throw Error("Wikipedia search failed.");
+
+  const data = await response.json();
+
+  return (data.pages || []).map(page => ({
+    title:page.title,
+    description:page.description || "",
+    excerpt:(page.excerpt || "").replace(/<[^>]*>/g,""),
+    url:page.key
+      ? "https://en.wikipedia.org/wiki/"+encodeURIComponent(page.key)
+      : ""
+  }));
+}
+
+/* ---------------- GROQ CHAT ---------------- */
+
+async function askAI(messages) {
+  if (!cfg.groq) {
+    throw Error("Add your Groq API key in Settings.");
   }
 
-  function previewCurrentProject() {
-    const project = projects.find(p => p.id === activeProjectId);
-
-    if (!project) {
-      addMessage("assistant", "Select a project before trying to preview it.");
-      return;
-    }
-
-    $("projectPreview").srcdoc = project.code;
-    $("previewStatus").textContent = "LOCAL PROJECT PREVIEW";
-  }
-
-  // ---------------- MODEL TOOLS ----------------
-
-  const availableTools = [
-    {
-      type: "function",
-      function: {
-        name: "list_files",
-        description: "List files and folders in the authorized workspace. Use empty path for root.",
-        parameters: {
-          type: "object",
-          properties: {
-            path: { type: "string" }
-          },
-          required: ["path"]
-        }
-      }
+  const response = await fetch(CHAT_URL,{
+    method:"POST",
+    headers:{
+      Authorization:"Bearer "+cfg.groq,
+      "Content-Type":"application/json"
     },
-    {
-      type: "function",
-      function: {
-        name: "read_file",
-        description: "Read a text file from the authorized workspace.",
-        parameters: {
-          type: "object",
-          properties: {
-            path: { type: "string" }
-          },
-          required: ["path"]
-        }
-      }
-    },
-    {
-      type: "function",
-      function: {
-        name: "write_file",
-        description: "Create or replace a text file. Existing files are backed up when possible.",
-        parameters: {
-          type: "object",
-          properties: {
-            path: { type: "string" },
-            content: { type: "string" }
-          },
-          required: ["path", "content"]
-        }
-      }
-    },
-    {
-      type: "function",
-      function: {
-        name: "create_directory",
-        description: "Create a directory inside the authorized workspace.",
-        parameters: {
-          type: "object",
-          properties: {
-            path: { type: "string" }
-          },
-          required: ["path"]
-        }
-      }
-    },
-    {
-      type: "function",
-      function: {
-        name: "delete_file",
-        description: "Move a file to .jarvis-trash, not permanent deletion.",
-        parameters: {
-          type: "object",
-          properties: {
-            path: { type: "string" }
-          },
-          required: ["path"]
-        }
-      }
-    },
-    {
-      type: "function",
-      function: {
-        name: "preview_file",
-        description: "Load an HTML file from the workspace into the project preview. Use after creating or updating the HTML page.",
-        parameters: {
-          type: "object",
-          properties: {
-            path: { type: "string" }
-          },
-          required: ["path"]
-        }
-      }
-    }
+    body:JSON.stringify({
+      model:cfg.model,
+      messages,
+      temperature:.4,
+      max_tokens:1800
+    })
+  });
+
+  const data = await response.json().catch(() => ({}));
+
+  if (!response.ok) {
+    throw Error(data.error?.message || "Groq error "+response.status);
+  }
+
+  return data.choices?.[0]?.message?.content?.trim() || "";
+}
+
+async function getAIResponse(userText) {
+  actionHistoryHandled = false;
+
+  const messages = [
+    {role:"system",content:SYSTEM},
+    ...history.slice(-14),
+    {role:"user",content:userText}
   ];
 
-  async function executeTool(name, args) {
-    switch (name) {
-      case "list_files":
-        return JSON.stringify(
-          await listWorkspaceFolder(args.path || ""),
-          null,
-          2
-        );
+  const first = await askAI(messages);
+  const project = parseCodeResponse(first);
+  const command = parseDirective(first);
 
-      case "read_file":
-        return await readWorkspaceFile(args.path);
-
-      case "write_file": {
-        const result = await writeWorkspaceFile(args.path, args.content);
-        await refreshFileTree();
-        return result;
-      }
-
-      case "create_directory":
-        return await createWorkspaceDirectory(args.path);
-
-      case "delete_file":
-        return await moveFileToTrash(args.path);
-
-      case "preview_file":
-        await previewHtmlFile(args.path);
-        return `Preview loaded successfully: ${args.path}`;
-
-      default:
-        throw new Error("Unknown tool: " + name);
+  if (project) {
+    if (!user) {
+      throw Error("Sign in to Supabase before creating an online project.");
     }
+
+    const saved = await saveProject(project.name,project.files);
+
+    history.push(
+      {role:"user",content:userText},
+      {role:"assistant",content:first},
+      {
+        role:"user",
+        content:`INTERNAL RESULT: Project "${saved.name}" was saved successfully in the cloud. Files: ${Object.keys(saved.files || {}).join(", ")}. The intermediate code response was hidden and must not be spoken. Give a short natural confirmation. Do not repeat the marker.`
+      }
+    );
+
+    actionHistoryHandled = true;
+
+    return askAI([
+      {role:"system",content:SYSTEM},
+      ...history.slice(-16)
+    ]);
   }
 
-  async function groqRequest(messages) {
-    const response = await fetch(CHAT_URL, {
-      method: "POST",
-      headers: {
-        Authorization: "Bearer " + apiKey,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({
-        model: settings.model,
-        messages,
-        tools: availableTools,
-        tool_choice: "auto",
-        parallel_tool_calls: false,
-        temperature: 0.35,
-        max_completion_tokens: 2400,
-        stream: false
-      })
+  if (command?.type === "read") {
+    const found = findProject(command.name);
+
+    history.push(
+      {role:"user",content:userText},
+      {role:"assistant",content:first},
+      {
+        role:"user",
+        content:found
+          ? `INTERNAL PROJECT CONTENT: ${JSON.stringify({
+              name:found.name,
+              files:normalizeFiles(found.files)
+            })}. Use this project as context for the user's request.`
+          : `INTERNAL RESULT: No cloud project named "${command.name}" was found. Tell the user honestly.`
+      }
+    );
+
+    actionHistoryHandled = true;
+
+    return askAI([
+      {role:"system",content:SYSTEM},
+      ...history.slice(-16)
+    ]);
+  }
+
+  if (command?.type === "search") {
+    let results;
+
+    try {
+      results = await searchWikipedia(command.query);
+    } catch (error) {
+      results = {error:error.message};
+    }
+
+    history.push(
+      {role:"user",content:userText},
+      {role:"assistant",content:first},
+      {
+        role:"user",
+        content:`INTERNAL WIKIPEDIA SEARCH RESULTS for "${command.query}": ${JSON.stringify(results)}. Answer the original request using these results. State that this is a Wikipedia-focused search, not the whole web.`
+      }
+    );
+
+    actionHistoryHandled = true;
+
+    return askAI([
+      {role:"system",content:SYSTEM},
+      ...history.slice(-16)
+    ]);
+  }
+
+  return first;
+}
+
+async function sendMessage(text) {
+  const value = text.trim();
+
+  if (!value || busy) return;
+
+  addMessage("user",value);
+  $("promptInput").value = "";
+  setBusy(true);
+
+  try {
+    const response = await getAIResponse(value);
+
+    if (actionHistoryHandled) {
+      history.push({role:"assistant",content:response});
+    } else {
+      history.push(
+        {role:"user",content:value},
+        {role:"assistant",content:response}
+      );
+    }
+
+    if (history.length > 28) {
+      history = history.slice(-22);
+    }
+
+    addMessage("assistant",response,true);
+    speak(response);
+
+    setStatus(user ? "CLOUD ONLINE" : "AI READY");
+
+  } catch (error) {
+    console.error(error);
+    addMessage("assistant","I couldn't complete that request: "+error.message);
+    setStatus("ERROR",false);
+  } finally {
+    setBusy(false);
+  }
+}
+
+/* ---------------- VOICE OUTPUT ---------------- */
+
+function availableVoices() {
+  return window.speechSynthesis?.getVoices?.() || [];
+}
+
+function chooseVoice() {
+  const list = availableVoices();
+  const selected = $("voiceSelect").value;
+
+  if (selected !== "auto") {
+    return list.find(v => v.name === selected) || null;
+  }
+
+  const english = list.filter(v => /^en[-_]/i.test(v.lang));
+  const maleName = /daniel|george|oliver|arthur|james|ryan|guy|male|alex|fred|david|tom/i;
+
+  return english.find(v => /en-GB/i.test(v.lang) && maleName.test(v.name)) ||
+    english.find(v => maleName.test(v.name)) ||
+    english.find(v => /en-GB/i.test(v.lang)) ||
+    english[0] ||
+    list[0] ||
+    null;
+}
+
+function populateVoices() {
+  const select = $("voiceSelect");
+  const oldValue = select.value;
+
+  select.innerHTML =
+    '<option value="auto">Best available British male voice</option>';
+
+  for (const voice of availableVoices()) {
+    const option = document.createElement("option");
+    option.value = voice.name;
+    option.textContent = `${voice.name} (${voice.lang})`;
+    select.append(option);
+  }
+
+  if ([...select.options].some(o => o.value === oldValue)) {
+    select.value = oldValue;
+  }
+}
+
+function speak(text) {
+  if (!$("speakToggle").checked || !window.speechSynthesis) return;
+
+  speechSynthesis.cancel();
+
+  const clean = String(text)
+    .replace(/```[\s\S]*?```/g,"Code omitted.")
+    .replace(/`([^`]+)`/g,"$1")
+    .slice(0,3000);
+
+  const utterance = new SpeechSynthesisUtterance(clean);
+  const voice = chooseVoice();
+
+  if (voice) {
+    utterance.voice = voice;
+    utterance.lang = voice.lang;
+  } else {
+    utterance.lang = "en-GB";
+  }
+
+  utterance.rate = .91;
+  utterance.pitch = .78;
+  utterance.volume = 1;
+
+  speechSynthesis.speak(utterance);
+}
+
+/* ---------------- MICROPHONE ---------------- */
+
+function releaseMicrophone() {
+  if (stream) {
+    stream.getTracks().forEach(track => track.stop());
+    stream = null;
+  }
+
+  recorder = null;
+  listening = false;
+  $("micButton").classList.remove("active");
+}
+
+async function transcribeAudio(blob) {
+  if (blob.size < 1200) {
+    $("micStatus").textContent = "No speech detected.";
+    return;
+  }
+
+  if (!cfg.groq) {
+    $("micStatus").textContent = "Add Groq key for Whisper.";
+    return;
+  }
+
+  $("micStatus").textContent = "Transcribing...";
+
+  try {
+    const extension = blob.type.includes("ogg")
+      ? "ogg"
+      : blob.type.includes("mp4")
+        ? "mp4"
+        : "webm";
+
+    const form = new FormData();
+
+    form.append("file",blob,"voice."+extension);
+    form.append("model","whisper-large-v3-turbo");
+    form.append("response_format","json");
+
+    const response = await fetch(WHISPER_URL,{
+      method:"POST",
+      headers:{Authorization:"Bearer "+cfg.groq},
+      body:form
     });
 
-    const data = await response.json().catch(() => ({}));
+    const data = await response.json();
 
     if (!response.ok) {
-      throw new Error(data?.error?.message || "HTTP " + response.status);
+      throw Error(data.error?.message || "Whisper "+response.status);
     }
 
-    return data?.choices?.[0]?.message;
+    if (data.text?.trim()) {
+      sendMessage(data.text.trim());
+    } else {
+      $("micStatus").textContent = "No speech recognized.";
+    }
+
+  } catch (error) {
+    $("micStatus").textContent = "Transcription failed: "+error.message;
+  }
+}
+
+async function startMicrophone() {
+  if (listening) {
+    stopMicrophone();
+    return;
   }
 
-  async function processAgentRequest(userText) {
-    const messages = [
-      {
-        role: "system",
-        content: settings.systemPrompt +
-          "\n\nWorkspace connected: " +
-          (workspaceHandle ? workspaceHandle.name : "No") +
-          ". If the user requests file creation without a connected workspace, clearly request connection; do not pretend. When creating a 3D scene or web project, use tools to create a complete working page and call preview_file."
-      },
-      ...history.slice(-16)
-    ];
+  const SpeechRecognition =
+    window.SpeechRecognition || window.webkitSpeechRecognition;
 
-    let response = null;
-    let step = 0;
+  if (SpeechRecognition) {
+    try {
+      recognition = new SpeechRecognition();
+      recognition.lang = "en-GB";
+      recognition.continuous = false;
+      recognition.interimResults = false;
 
-    while (step < 8) {
-      step++;
+      recognition.onresult = event => {
+        const transcript = event.results?.[0]?.[0]?.transcript;
+        if (transcript) sendMessage(transcript);
+      };
 
-      response = await groqRequest(messages);
+      recognition.onerror = event => {
+        $("micStatus").textContent =
+          "Speech recognition: "+event.error;
+      };
 
-      if (!response) {
-        throw new Error("The AI returned an empty response.");
-      }
+      recognition.onend = () => {
+        listening = false;
+        $("micButton").classList.remove("active");
+      };
 
-      messages.push(response);
-
-      if (!response.tool_calls?.length) break;
-
-      for (const call of response.tool_calls) {
-        let result;
-
-        try {
-          const args = JSON.parse(call.function.arguments || "{}");
-
-          if (!workspaceHandle) {
-            throw new Error("No PC folder is connected. Connect a folder before asking me to access files.");
-          }
-
-          result = await executeTool(call.function.name, args);
-        } catch (error) {
-          result = "Tool error: " + error.message;
-        }
-
-        messages.push({
-          role: "tool",
-          tool_call_id: call.id,
-          name: call.function.name,
-          content: String(result).slice(0, 14000)
-        });
-      }
-    }
-
-    if (response?.tool_calls?.length && step >= 8) {
-      messages.push({
-        role: "system",
-        content: "Tool-call limit reached. Summarize only what has actually been completed and what remains."
-      });
-
-      response = await groqRequest(messages);
-    }
-
-    return response?.content?.trim() || "The requested operations have been processed.";
-  }
-
-  // ---------------- CHAT QUEUE ----------------
-
-  function sendToJarvis(text) {
-    const message = text.trim();
-
-    if (!message) return;
-
-    if (!apiKey) {
-      addMessage("assistant", "Please configure your Groq API key in settings.");
-      $("settingsDialog").showModal();
+      listening = true;
+      $("micButton").classList.add("active");
+      $("micStatus").textContent = "Listening...";
+      recognition.start();
       return;
-    }
 
-    addMessage("user", message);
-    requestQueue.push(message);
-    processQueue();
+    } catch (error) {
+      console.warn(error);
+    }
   }
 
-  async function processQueue() {
-    if (processingQueue) return;
+  if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder) {
+    $("micStatus").textContent = "Microphone unsupported in this browser.";
+    return;
+  }
 
-    processingQueue = true;
+  if (!cfg.groq) {
+    $("micStatus").textContent = "Add Groq key to use Whisper.";
+    return;
+  }
 
-    while (requestQueue.length) {
-      const userText = requestQueue.shift();
-
-      history.push({
-        role: "user",
-        content: userText
-      });
-
-      setBusy(true);
-      setStatus("CONNECTING TO JARVIS...");
-
-      try {
-        const answer = await processAgentRequest(userText);
-
-        history.push({
-          role: "assistant",
-          content: answer
-        });
-
-        if (history.length > 30) {
-          history = history.slice(-24);
-        }
-
-        addMessage("assistant", answer, true);
-        speak(answer);
-        setStatus("SYSTEM READY");
-      } catch (error) {
-        console.error("JARVIS request failed:", error);
-
-        addMessage(
-          "assistant",
-          "SYSTEM ERROR: " + error.message +
-          "\n\nCheck your API key, model, Internet connection and Groq account limits."
-        );
-
-        setStatus("API ERROR", false);
-      } finally {
-        setBusy(false);
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      audio:{
+        echoCancellation:true,
+        noiseSuppression:true,
+        autoGainControl:true
       }
-    }
+    });
 
-    processingQueue = false;
-  }
-
-  // ---------------- MICROPHONE: VAD + MEDIARECORDER + WHISPER ----------------
-
-  function updateVoiceButton() {
-    $("voiceButton").textContent = listening
-      ? "■ STOP LISTENING"
-      : "🎙 START CONTINUOUS LISTENING";
-  }
-
-  function supportedMimeType() {
-    const types = [
+    const mimeTypes = [
       "audio/webm;codecs=opus",
       "audio/webm",
       "audio/ogg;codecs=opus",
       "audio/mp4"
     ];
 
-    return types.find(type =>
-      window.MediaRecorder?.isTypeSupported?.(type)
+    const mime = mimeTypes.find(type =>
+      MediaRecorder.isTypeSupported(type)
     ) || "";
-  }
 
-  async function transcribeBlob(blob) {
-    if (!blob || blob.size < 1200 || transcriptionBusy) return;
+    recorder = new MediaRecorder(
+      stream,
+      mime ? {mimeType:mime} : undefined
+    );
 
-    transcriptionBusy = true;
-    $("voiceHint").textContent = "Transcribing your speech...";
+    chunks = [];
 
-    try {
-      const form = new FormData();
-
-      const ext = blob.type.includes("ogg")
-        ? "ogg"
-        : blob.type.includes("mp4")
-          ? "mp4"
-          : "webm";
-
-      form.append("file", blob, "jarvis-recording." + ext);
-      form.append("model", "whisper-large-v3-turbo");
-      form.append("language", settings.language === "fr-FR" ? "fr" : "en");
-      form.append("response_format", "json");
-      form.append("temperature", "0");
-
-      const response = await fetch(STT_URL, {
-        method: "POST",
-        headers: {
-          Authorization: "Bearer " + apiKey
-        },
-        body: form
-      });
-
-      const data = await response.json().catch(() => ({}));
-
-      if (!response.ok) {
-        throw new Error(data?.error?.message || "Whisper HTTP " + response.status);
-      }
-
-      const transcript = String(data.text || "").trim();
-
-      if (transcript && listening) {
-        $("voiceHint").textContent = "Recognized: " + transcript;
-        sendToJarvis(transcript);
-      } else if (listening) {
-        $("voiceHint").textContent = "Listening continuously...";
-      }
-    } catch (error) {
-      console.error("Whisper error:", error);
-      $("voiceHint").textContent = "Transcription failed: " + error.message;
-    } finally {
-      transcriptionBusy = false;
-    }
-  }
-
-  function beginRecording() {
-    if (!listening || !micStream || mediaRecorder || speaking) return;
-
-    try {
-      const mimeType = supportedMimeType();
-
-      mediaRecorder = new MediaRecorder(
-        micStream,
-        mimeType ? { mimeType } : undefined
-      );
-
-      recordingChunks = [];
-      speechDetected = false;
-      recordingStartedAt = Date.now();
-      lastVoiceAt = 0;
-
-      mediaRecorder.ondataavailable = event => {
-        if (event.data?.size) {
-          recordingChunks.push(event.data);
-        }
-      };
-
-      mediaRecorder.onstop = () => {
-        const type = mediaRecorder?.mimeType || mimeType || "audio/webm";
-        const blob = new Blob(recordingChunks, { type });
-
-        mediaRecorder = null;
-        recordingChunks = [];
-
-        if (speechDetected) {
-          transcribeBlob(blob);
-        }
-
-        if (listening) {
-          setTimeout(beginRecording, 180);
-        }
-      };
-
-      mediaRecorder.start(250);
-      $("voiceHint").textContent = "Listening continuously...";
-    } catch (error) {
-      console.error("Recorder start:", error);
-      $("voiceHint").textContent = "Recording error: " + error.message;
-    }
-  }
-
-  function monitorMicrophone() {
-    if (!listening || !analyser) return;
-
-    const data = new Uint8Array(analyser.fftSize);
-    analyser.getByteTimeDomainData(data);
-
-    let sum = 0;
-
-    for (let i = 0; i < data.length; i++) {
-      const v = (data[i] - 128) / 128;
-      sum += v * v;
-    }
-
-    const rms = Math.sqrt(sum / data.length);
-    const now = Date.now();
-
-    // Adaptive-ish threshold: suppress room noise while still detecting normal speech.
-    if (rms > 0.025) {
-      speechDetected = true;
-      lastVoiceAt = now;
-    }
-
-    if (
-      mediaRecorder?.state === "recording" &&
-      speechDetected &&
-      now - lastVoiceAt > 1150 &&
-      now - recordingStartedAt > 650
-    ) {
-      try {
-        mediaRecorder.stop();
-      } catch {}
-    }
-
-    // Avoid sending JARVIS audio back to Whisper. Restart recording after TTS completes.
-    if (speaking && mediaRecorder?.state === "recording") {
-      try {
-        mediaRecorder.stop();
-      } catch {}
-    }
-
-    micAnimation = requestAnimationFrame(monitorMicrophone);
-  }
-
-  async function startListening() {
-    if (listening) return;
-
-    if (!apiKey) {
-      $("voiceHint").textContent = "Configure your Groq API key before using the microphone.";
-      $("settingsDialog").showModal();
-      return;
-    }
-
-    if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder) {
-      $("voiceHint").textContent = "This browser does not support microphone recording. Use a recent browser over HTTPS.";
-      return;
-    }
-
-    try {
-      listening = true;
-      updateVoiceButton();
-
-      $("voiceHint").textContent = "Requesting microphone permission...";
-
-      micStream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true
-        }
-      });
-
-      const AudioContextClass = window.AudioContext || window.webkitAudioContext;
-
-      audioContext = new AudioContextClass();
-      await audioContext.resume();
-
-      const source = audioContext.createMediaStreamSource(micStream);
-
-      analyser = audioContext.createAnalyser();
-      analyser.fftSize = 2048;
-
-      source.connect(analyser);
-
-      beginRecording();
-      monitorMicrophone();
-    } catch (error) {
-      listening = false;
-      updateVoiceButton();
-
-      $("voiceHint").textContent =
-        "Microphone access failed: " + error.message +
-        ". Check Opera's site microphone permission and Windows input settings.";
-
-      stopListening(false);
-    }
-  }
-
-  function stopListening(updateHint = true) {
-    listening = false;
-    updateVoiceButton();
-
-    cancelAnimationFrame(micAnimation);
-
-    if (mediaRecorder?.state === "recording") {
-      try {
-        mediaRecorder.stop();
-      } catch {}
-    }
-
-    if (micStream) {
-      micStream.getTracks().forEach(track => track.stop());
-      micStream = null;
-    }
-
-    if (audioContext) {
-      audioContext.close().catch(() => {});
-      audioContext = null;
-    }
-
-    analyser = null;
-
-    if (updateHint) {
-      $("voiceHint").textContent = "Microphone stopped.";
-    }
-
-    stopSpeaking();
-  }
-
-  // ---------------- CONNECT / DISCONNECT WORKSPACE ----------------
-
-  async function connectWorkspace() {
-    if (!window.showDirectoryPicker) {
-      addMessage(
-        "assistant",
-        "This browser does not support direct folder access. Use a recent desktop Chromium browser over HTTPS."
-      );
-      return;
-    }
-
-    try {
-      const selected = await window.showDirectoryPicker({ mode: "readwrite" });
-
-      const permission = await selected.requestPermission({
-        mode: "readwrite"
-      });
-
-      if (permission !== "granted") {
-        throw new Error("Read/write permission was not granted.");
-      }
-
-      workspaceHandle = selected;
-
-      $("workspaceStatus").textContent = "CONNECTED";
-      $("workspaceDescription").textContent = selected.name;
-
-      $("folderPermissionBadge").textContent = "READ / WRITE AUTHORIZED";
-      $("folderPermissionBadge").classList.add("connected");
-
-      $("folderDescription").textContent =
-        "JARVIS can now manage files inside this folder.";
-
-      $("folderPath").textContent = "Authorized folder: " + selected.name;
-      $("disconnectFolder").disabled = false;
-
-      await refreshFileTree();
-
-      addMessage(
-        "assistant",
-        `Workspace connected: ${selected.name}. I can now manage files inside this folder only.`
-      );
-    } catch (error) {
-      if (error.name !== "AbortError") {
-        addMessage("assistant", "Folder connection failed: " + error.message);
-      }
-    }
-  }
-
-  function disconnectWorkspace() {
-    workspaceHandle = null;
-    activeFilePath = null;
-    activeFileHandle = null;
-
-    $("workspaceStatus").textContent = "DISCONNECTED";
-    $("workspaceDescription").textContent = "No folder authorized";
-
-    $("folderPermissionBadge").textContent = "NOT CONNECTED";
-    $("folderPermissionBadge").classList.remove("connected");
-
-    $("folderDescription").textContent =
-      "Authorize a folder to let JARVIS create, read and edit files inside it.";
-
-    $("folderPath").textContent = "No folder selected";
-    $("disconnectFolder").disabled = true;
-
-    $("fileTree").innerHTML =
-      '<div class="empty-state">Connect a folder to browse its files.</div>';
-
-    $("editorName").textContent = "No file selected";
-    $("codeEditor").value = "";
-    $("saveStatus").textContent = "READY";
-    $("runPreview").disabled = true;
-
-    addMessage("assistant", "The PC workspace has been disconnected.");
-  }
-
-  // ---------------- PROJECTS ----------------
-
-  function renderProjects() {
-    const container = $("projectList");
-    container.replaceChildren();
-
-    if (!projects.length) {
-      const empty = document.createElement("div");
-      empty.className = "empty-state";
-      empty.textContent = "No projects yet. Create your first project.";
-      container.appendChild(empty);
-      return;
-    }
-
-    projects.forEach(project => {
-      const row = document.createElement("div");
-      row.className = "project-item";
-
-      const name = document.createElement("span");
-      name.textContent = project.name;
-
-      const actions = document.createElement("div");
-
-      const open = document.createElement("button");
-      open.textContent = "OPEN";
-      open.onclick = () => openProject(project.id);
-
-      const remove = document.createElement("button");
-      remove.textContent = "✕";
-
-      remove.onclick = () => {
-        if (!confirm("Delete " + project.name + "?")) return;
-
-        projects = projects.filter(p => p.id !== project.id);
-
-        if (activeProjectId === project.id) {
-          activeProjectId = null;
-          activeFilePath = null;
-          $("editorName").textContent = "No file selected";
-          $("codeEditor").value = "";
-          $("runPreview").disabled = true;
-        }
-
-        saveJSON(PROJECTS_KEY, projects);
-        renderProjects();
-      };
-
-      actions.append(open, remove);
-      row.append(name, actions);
-      container.appendChild(row);
-    });
-  }
-
-  function openProject(id) {
-    const project = projects.find(p => p.id === id);
-
-    if (!project) return;
-
-    activeProjectId = id;
-    activeFilePath = null;
-    activeFileHandle = null;
-
-    $("editorName").textContent = project.name + " / main.txt";
-    $("codeEditor").value = project.code || "";
-    $("saveStatus").textContent = "PROJECT LOADED";
-    $("runPreview").disabled = false;
-  }
-
-  function createProject() {
-    const name = $("projectName").value.trim();
-
-    if (!name) {
-      $("projectName").focus();
-      return;
-    }
-
-    const project = {
-      id: crypto.randomUUID ? crypto.randomUUID() : String(Date.now()),
-      name,
-      code: "// " + name + "\n\n",
-      updated: Date.now()
+    recorder.ondataavailable = event => {
+      if (event.data?.size) chunks.push(event.data);
     };
 
-    projects.unshift(project);
+    recorder.onstop = async () => {
+      const blob = new Blob(chunks,{
+        type:recorder?.mimeType || mime || "audio/webm"
+      });
 
-    if (!saveJSON(PROJECTS_KEY, projects)) return;
-
-    activeProjectId = project.id;
-
-    renderProjects();
-    openProject(project.id);
-
-    $("projectDialog").close();
-    $("projectName").value = "";
-  }
-
-  function saveCode() {
-    const project = projects.find(p => p.id === activeProjectId);
-
-    if (!project) {
-      $("saveStatus").textContent = "NO PROJECT OPEN";
-      return;
-    }
-
-    project.code = $("codeEditor").value;
-    project.updated = Date.now();
-
-    if (saveJSON(PROJECTS_KEY, projects)) {
-      $("saveStatus").textContent = "SAVED ✓";
-    }
-  }
-
-  function exportCode() {
-    const content = $("codeEditor").value;
-
-    if (!content.trim()) {
-      $("saveStatus").textContent = "NOTHING TO EXPORT";
-      return;
-    }
-
-    const project = projects.find(p => p.id === activeProjectId);
-
-    const filename = activeFilePath
-      ? activeFilePath.split("/").at(-1)
-      : (project?.name || "jarvis-project") + ".txt";
-
-    const blob = new Blob([content], {
-      type: "text/plain;charset=utf-8"
-    });
-
-    const url = URL.createObjectURL(blob);
-
-    const link = document.createElement("a");
-    link.href = url;
-    link.download = filename;
-
-    document.body.appendChild(link);
-    link.click();
-    link.remove();
-
-    setTimeout(() => URL.revokeObjectURL(url), 1000);
-  }
-
-  // ---------------- SETTINGS ----------------
-
-  $("settingsButton").onclick = () => {
-    $("apiKey").value = apiKey;
-    $("modelSelect").value = settings.model;
-    $("languageSelect").value = settings.language;
-    $("systemPrompt").value = settings.systemPrompt;
-
-    $("settingsDialog").showModal();
-  };
-
-  $("saveSettings").onclick = () => {
-    apiKey = $("apiKey").value.trim();
-
-    settings = {
-      model: $("modelSelect").value,
-      language: $("languageSelect").value,
-      systemPrompt: $("systemPrompt").value.trim() || DEFAULT_SYSTEM
+      await transcribeAudio(blob);
+      releaseMicrophone();
     };
 
-    if (apiKey) {
-      sessionStorage.setItem("jarvis_groq_key", apiKey);
-    } else {
-      sessionStorage.removeItem("jarvis_groq_key");
-    }
+    recorder.start();
 
-    saveJSON(SETTINGS_KEY, settings);
+    listening = true;
+    $("micButton").classList.add("active");
+    $("micStatus").textContent = "Recording — press microphone to stop.";
 
-    $("tokenNote").textContent = apiKey ? "API KEY ACTIVE" : "NO API KEY";
-    $("aiStatus").textContent = apiKey ? "READY" : "OFFLINE";
+  } catch (error) {
+    $("micStatus").textContent = "Microphone error: "+error.message;
+    releaseMicrophone();
+  }
+}
 
-    $("settingsStatus").textContent = "Settings saved on this device.";
-    $("settingsDialog").close();
-  };
-
-  $("testConnection").onclick = async () => {
-    const key = $("apiKey").value.trim();
-
-    if (!key) {
-      $("settingsStatus").textContent = "Please enter your API key first.";
-      return;
-    }
-
-    $("settingsStatus").textContent = "Testing Groq connection...";
-
+function stopMicrophone() {
+  if (recognition) {
     try {
-      const response = await fetch(
-        "https://api.groq.com/openai/v1/models",
-        {
-          headers: {
-            Authorization: "Bearer " + key
-          }
-        }
-      );
+      recognition.stop();
+    } catch {}
 
-      const data = await response.json().catch(() => ({}));
+    recognition = null;
+  }
 
-      if (!response.ok) {
-        throw new Error(data?.error?.message || "HTTP " + response.status);
-      }
+  if (recorder?.state === "recording") {
+    recorder.stop();
+  } else {
+    releaseMicrophone();
+  }
 
-      $("settingsStatus").textContent =
-        "Connection successful. Groq API is reachable.";
-    } catch (error) {
-      $("settingsStatus").textContent =
-        "Connection failed: " + error.message;
-    }
-  };
+  listening = false;
+  $("micButton").classList.remove("active");
+}
 
-  // ---------------- UI EVENTS ----------------
+/* ---------------- SETTINGS AND EVENTS ---------------- */
+
+function openSettings() {
+  $("groqKey").value = cfg.groq;
+  $("modelSelect").value = cfg.model;
+  $("supabaseUrl").value = cfg.url;
+  $("supabaseKey").value = cfg.anon;
+
+  $("settingsDialog").showModal();
+}
+
+function saveSettings() {
+  cfg.groq = $("groqKey").value.trim();
+  cfg.model = $("modelSelect").value;
+  cfg.url = $("supabaseUrl").value.trim().replace(/\/+$/,"");
+  cfg.anon = $("supabaseKey").value.trim();
+
+  saveSettingsToStorage();
+  $("settingsDialog").close();
+  initializeDatabase();
+}
+
+function saveSettingsToStorage() {
+  saveSettings();
+}
+
+function bindEvents() {
+  $("settingsOpen").onclick = openSettings;
+  $("saveSettings").onclick = saveSettings;
+
+  $("signIn").onclick = () =>
+    authenticate("signin").catch(error => {
+      $("authStatus").textContent = error.message;
+    });
+
+  $("signUp").onclick = () =>
+    authenticate("signup").catch(error => {
+      $("authStatus").textContent = error.message;
+    });
+
+  $("signOut").onclick = () => signOut().catch(cloudError);
 
   $("chatForm").onsubmit = event => {
     event.preventDefault();
-
-    const text = $("promptInput").value.trim();
-
-    if (!text) return;
-
-    $("promptInput").value = "";
-    sendToJarvis(text);
+    sendMessage($("promptInput").value);
   };
 
   $("promptInput").onkeydown = event => {
@@ -1460,105 +1091,98 @@ WORKSPACE RULES:
     }
   };
 
-  $("voiceButton").onclick = () => {
-    listening ? stopListening() : startListening();
-  };
+  $("micButton").onclick = startMicrophone;
+  $("fileSelect").onchange = changeFile;
 
-  $("speakToggle").onchange = event => {
-    if (!event.target.checked) {
-      stopSpeaking();
+  $("saveFile").onclick = () =>
+    saveCurrentFile().catch(cloudError);
+
+  $("previewFile").onclick = previewProject;
+
+  $("downloadProject").onclick = () =>
+    exportProject().catch(error => alert(error.message));
+
+  $("openPreview").onclick = () => {
+    const frame = $("previewFrame");
+    const tab = window.open("about:blank","_blank");
+
+    if (tab) {
+      tab.document.open();
+      tab.document.write(frame.srcdoc);
+      tab.document.close();
     }
   };
 
-  $("clearChat").onclick = () => {
-    history = [];
-    requestQueue = [];
-
-    $("chatLog").replaceChildren();
-
-    addMessage("assistant", "Conversation cleared. I am ready.");
-  };
-
-  $("focusChat").onclick = () => $("promptInput").focus();
-
-  $("fullscreenButton").onclick = async () => {
-    try {
-      if (!document.fullscreenElement) {
-        await document.documentElement.requestFullscreen();
-      } else {
-        await document.exitFullscreen();
-      }
-    } catch {
-      addMessage("assistant", "Fullscreen mode was not allowed by the browser.");
+  $("newProject").onclick = () => {
+    if (!user) {
+      $("projectDialogStatus").textContent = "Sign in first.";
     }
+
+    $("projectName").value = "";
+    $("projectDialog").showModal();
   };
 
-  $("newProject").onclick = () => $("projectDialog").showModal();
-  $("createProject").onclick = createProject;
-
-  $("projectName").onkeydown = event => {
-    if (event.key === "Enter") createProject();
-  };
-
-  $("saveCode").onclick = () => {
-    saveActiveFile().catch(error =>
-      addMessage("assistant", "Save failed: " + error.message)
-    );
-  };
-
-  $("downloadCode").onclick = exportCode;
-
-  $("copyCode").onclick = async () => {
+  $("createProject").onclick = async () => {
     try {
-      await navigator.clipboard.writeText($("codeEditor").value);
-      $("saveStatus").textContent = "COPIED ✓";
-    } catch {
-      $("saveStatus").textContent = "COPY NOT AVAILABLE";
-    }
-  };
+      const name = $("projectName").value.trim();
 
-  $("connectFolder").onclick = connectWorkspace;
-  $("disconnectFolder").onclick = disconnectWorkspace;
+      if (!name) throw Error("Enter a project name.");
 
-  $("refreshFiles").onclick = () => {
-    refreshFileTree().catch(error =>
-      addMessage("assistant", "Could not refresh files: " + error.message)
-    );
-  };
+      await saveProject(name,{
+        "README.txt":`# ${name}\n\nCreated in JARVIS Cloud Workspace.\n`
+      });
 
-  $("runPreview").onclick = async () => {
-    try {
-      if (activeFilePath) {
-        await previewHtmlFile(activeFilePath);
-      } else {
-        previewCurrentProject();
-      }
+      $("projectDialog").close();
+
     } catch (error) {
-      addMessage("assistant", "Preview failed: " + error.message);
+      $("projectDialogStatus").textContent = error.message;
     }
   };
 
-  // ---------------- STARTUP ----------------
+  $("importProject").onclick = () => $("zipInput").click();
 
-  $("tokenNote").textContent = apiKey ? "API KEY ACTIVE" : "NO API KEY";
-  $("aiStatus").textContent = apiKey ? "READY" : "OFFLINE";
-  $("systemPrompt").value = settings.systemPrompt;
+  $("zipInput").onchange = async event => {
+    const zipFile = event.target.files?.[0];
+    if (!zipFile) return;
 
-  renderProjects();
-  updateVoiceButton();
+    try {
+      await importProject(zipFile);
+      setSync("ZIP imported to cloud ✓");
+    } catch (error) {
+      alert("Import failed: "+error.message);
+    } finally {
+      event.target.value = "";
+    }
+  };
 
-  if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder) {
-    $("voiceButton").disabled = true;
+  $("testVoice").onclick = () =>
+    speak("Good evening. All systems are operational. How may I assist you?");
+}
 
-    $("voiceHint").textContent =
-      "Microphone recording is not supported in this browser. Use a recent browser over HTTPS.";
-  } else {
-    $("voiceHint").textContent =
-      "Press START and allow microphone access. Speech is transcribed by Groq Whisper.";
+function cloudError(error) {
+  console.error(error);
+  setSync("Cloud error: "+(error.message || error));
+}
+
+function initialize() {
+  bindEvents();
+  populateVoices();
+
+  if (window.speechSynthesis) {
+    speechSynthesis.onvoiceschanged = populateVoices;
   }
 
-  if (!window.showDirectoryPicker) {
-    $("folderDescription").textContent =
-      "This browser does not support direct folder access. Try a recent desktop Chromium browser.";
+  initializeDatabase();
+  clearEditor();
+
+  if (!cfg.groq) {
+    addMessage(
+      "assistant",
+      "Open Settings and add your Groq API key. Then sign in to Supabase to enable your online workspace."
+    );
   }
+}
+
+initialize();
+
 })();
