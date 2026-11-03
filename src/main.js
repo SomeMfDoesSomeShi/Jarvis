@@ -20,7 +20,37 @@ function openProject(id){activeProject=projects.find(p=>p.id===id);if(!activePro
 function exportProject(id){const p=projects.find(x=>x.id===id);if(!p)return;const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([JSON.stringify(p,null,2)],{type:'application/json'}));a.download=p.name.replace(/[^\w-]/g,'_')+'.jarvis.json';a.click();URL.revokeObjectURL(a.href);}
 function previewProject(){if(!activeProject)return;if(activeProject.kind==='vr'){spatial?.runProject(activeProject);return;}const f=activeProject.files,html=f['index.html']||'<h1>index.html missing</h1>',css=f['style.css']||'',js=f['app.js']||'';const doc=html.replace('</head>',`<style>${css.replace(/<\/style/gi,'<\\/style')}</style></head>`).replace('</body>',`<script>${js.replace(/<\/script/gi,'<\\/script')}<\/script></body>`);$('previewName').textContent=activeProject.name;$('projectFrame').srcdoc=doc;$('previewModal').classList.remove('hidden');}
 async function callJarvis(messages,action='chat',extra={}){if(!supabase||!session)throw new Error('Connecte-toi à Supabase dans Configuration avant d’utiliser l’IA.');const r=await fetch(`${settings.supabaseUrl}/functions/v1/jarvis`,{method:'POST',headers:{'Content-Type':'application/json','Authorization':`Bearer ${session.access_token}`,'apikey':settings.supabaseKey},body:JSON.stringify({action,messages,...extra})});if(!r.ok)throw new Error(`Service IA (${r.status}) : ${(await r.text()).slice(0,220)}`);return action==='speech'?r.blob():r.json();}
-const systemPrompt=`You are J.A.R.V.I.S., a concise, professional spatial AI assistant. Keep spoken replies short. Never claim an action succeeded if it did not. If the user requests a project, return exactly one block and no other code fences: <JARVIS_PROJECT>{"name":"Project name","kind":"web or vr","files":{"index.html":"...","style.css":"...","app.js":"...","vr.js":"..."}}</JARVIS_PROJECT>. Use kind vr for immersive Three.js projects. A vr.js file must export function mount({THREE,scene,camera,renderer,addPanel,addButton,onFrame}) and create objects in the supplied scene. Use addButton(label,onSelect,position) for selectable spatial buttons, and onFrame(fn) to register animation updates. Do not import three. For web projects provide index.html, style.css, app.js. Do not use tool calls.`;
+const systemPrompt = `You are J.A.R.V.I.S., a concise, professional spatial AI assistant.
+
+Keep spoken replies short. Never claim an action succeeded if it did not.
+
+PROJECT CREATION RULES:
+When the user asks you to create, build, or modify a project, you MUST return exactly one valid project block:
+
+<JARVIS_PROJECT>
+{"name":"Project name","kind":"web","files":{"index.html":"...","style.css":"...","app.js":"..."}}
+</JARVIS_PROJECT>
+
+STRICT FORMATTING:
+- Always include BOTH opening and closing JARVIS_PROJECT tags.
+- Never escape the tags with backslashes.
+- Never put the JSON inside Markdown code fences.
+- Output valid JSON, not JavaScript.
+- Escape newlines inside JSON strings as \\n.
+- Escape double quotes inside JSON strings as \\".
+- Do not add explanations before or after the project block.
+- Do not omit required files.
+- For web projects provide index.html, style.css and app.js.
+- For immersive projects use kind "vr" and provide vr.js.
+- Never claim a project was saved. The application handles saving.
+
+VR PROJECT RULES:
+A vr.js file must export function mount({THREE,scene,camera,renderer,addPanel,addButton,onFrame}).
+Do not import three.
+Use addButton(label,onSelect,position) for selectable spatial buttons.
+Use onFrame(fn) to register animation updates.
+
+Do not use tool calls.`;
 async function sendMessage(){const text=$('chatInput').value.trim();if(!text)return;$('chatInput').value='';addMessage('user',text);chatHistory.push({role:'user',content:text});$('sendMessage').disabled=true;try{let response;if(/^\[search on internet (.+)\]$/i.test(text)){const q=text.match(/^\[search on internet (.+)\]$/i)[1],r=await fetch(`https://en.wikipedia.org/w/rest.php/v1/search/page?q=${encodeURIComponent(q)}&limit=5`),d=await r.json();response=(d.pages||[]).map(p=>`${p.title}: ${p.description||''}`).join('\n')||'No useful results found.';}else if(/^\[read code (.+)\]$/i.test(text)){const name=text.match(/^\[read code (.+)\]$/i)[1],p=projects.find(x=>x.name.toLowerCase()===name.toLowerCase());if(p){chatHistory.push({role:'system',content:`Project source loaded: ${p.name}\n${JSON.stringify(p.files)}`});response=`Loaded ${p.name} into my context.`;}else response=`I couldn't find a project named ${name}.`;}else{const r=await callJarvis([{role:'system',content:systemPrompt},...chatHistory.slice(-10)]);response=r.choices?.[0]?.message?.content||'No response received.';}
 // Detect and normalize AI-generated project blocks
 const normalizedResponse = response
@@ -28,7 +58,7 @@ const normalizedResponse = response
   .replace(/\\(?=<\/?(?:!DOCTYPE|html|head|body|meta|title|link|script|style|canvas)\b)/gi, '');
 
 const m = normalizedResponse.match(
-  /<JARVIS_PROJECT>\s*([\s\S]*?)\s*<\/JARVIS_PROJECT>/i
+  /<JARVIS_PROJECT>\s*([\s\S]*?)(?:\s*<\/JARVIS_PROJECT>\s*|$)/i
 );
 
 if (m) {
