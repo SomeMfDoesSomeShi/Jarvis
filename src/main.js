@@ -30,13 +30,13 @@ let session = null;
 let projects = [];
 let activeProject = null;
 let spatial = null;
-
 let conversationId = null;
+let cloudReady = false;
+let britishVoice = null;
+
 let chatHistory = [
   { role: 'assistant', content: 'Systems online. How may I assist you?' }
 ];
-
-let cloudReady = false;
 
 /* -------------------------------------------------------
    GENERAL
@@ -62,14 +62,11 @@ function localProjects() {
 }
 
 function cacheProjects() {
-  localStorage.setItem(
-    LOCAL_PROJECTS_KEY,
-    JSON.stringify(projects)
-  );
+  localStorage.setItem(LOCAL_PROJECTS_KEY, JSON.stringify(projects));
 }
 
 /* -------------------------------------------------------
-   SUPABASE CONNECTION
+   SUPABASE
 ------------------------------------------------------- */
 
 function connectSupabase() {
@@ -118,10 +115,7 @@ function connectSupabase() {
         conversationId = null;
 
         chatHistory = [
-          {
-            role: 'assistant',
-            content: 'Systems online. How may I assist you?'
-          }
+          { role: 'assistant', content: 'Systems online. How may I assist you?' }
         ];
 
         projects = localProjects();
@@ -152,7 +146,6 @@ async function loadCloudData() {
 
   } catch (error) {
     console.error('Cloud synchronization error:', error);
-
     setStatus('Erreur de synchronisation');
 
     addMessage(
@@ -175,13 +168,9 @@ async function saveSettings() {
   settings.premiumVoice = $('premiumVoice').checked;
   settings.voice = $('voiceChoice').value;
 
-  localStorage.setItem(
-    SETTINGS_KEY,
-    JSON.stringify(settings)
-  );
+  localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
 
-  $('settingsStatus').textContent =
-    'Paramètres enregistrés localement.';
+  $('settingsStatus').textContent = 'Paramètres enregistrés localement.';
 
   if (
     oldUrl !== settings.supabaseUrl ||
@@ -239,10 +228,7 @@ async function loadUserSettings() {
     settings.voice = data.settings.voice || 'daniel';
     settings.premiumVoice = !!data.settings.premiumVoice;
 
-    localStorage.setItem(
-      SETTINGS_KEY,
-      JSON.stringify(settings)
-    );
+    localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
   }
 }
 
@@ -340,9 +326,7 @@ async function saveProject(project) {
     });
 
   if (error) {
-    throw new Error(
-      'Sauvegarde du projet impossible : ' + error.message
-    );
+    throw new Error('Sauvegarde du projet impossible : ' + error.message);
   }
 
   const index = projects.findIndex(p => p.id === project.id);
@@ -355,6 +339,52 @@ async function saveProject(project) {
 
   cacheProjects();
   renderProjects();
+}
+
+async function deleteProject(id) {
+  const project = projects.find(p => p.id === id);
+  if (!project) return;
+
+  if (!confirm(`Supprimer définitivement "${project.name}" ?`)) {
+    return;
+  }
+
+  if (!supabase || !session) {
+    alert('Connecte-toi à Supabase pour supprimer ce projet.');
+    return;
+  }
+
+  try {
+    const { data, error } = await supabase
+      .from('jarvis_projects')
+      .delete()
+      .eq('id', id)
+      .eq('user_id', session.user.id)
+      .select('id');
+
+    if (error) throw error;
+
+    if (!data || data.length === 0) {
+      throw new Error(
+        'Aucun projet supprimé. Vérifie les autorisations Supabase.'
+      );
+    }
+
+    projects = projects.filter(p => p.id !== id);
+
+    if (activeProject?.id === id) {
+      activeProject = null;
+      $('editorTitle').textContent = 'Aucun projet sélectionné';
+      $('editorContent').innerHTML = '';
+    }
+
+    cacheProjects();
+    renderProjects();
+
+  } catch (error) {
+    console.error('Project deletion failed:', error);
+    alert('Impossible de supprimer le projet : ' + error.message);
+  }
 }
 
 function renderProjects() {
@@ -384,6 +414,10 @@ function renderProjects() {
       <button class="tiny" data-export="${escapeHtml(project.id)}">
         Exporter
       </button>
+
+      <button class="tiny" data-delete="${escapeHtml(project.id)}">
+        Supprimer
+      </button>
     </article>
   `).join('');
 
@@ -393,6 +427,10 @@ function renderProjects() {
 
   grid.querySelectorAll('[data-export]').forEach(button => {
     button.onclick = () => exportProject(button.dataset.export);
+  });
+
+  grid.querySelectorAll('[data-delete]').forEach(button => {
+    button.onclick = () => deleteProject(button.dataset.delete);
   });
 }
 
@@ -404,19 +442,22 @@ function openProject(id) {
 
   $('editorTitle').textContent = activeProject.name;
 
+  const files = activeProject.files || {};
+
+  const source = Object.entries(files)
+    .map(([filename, content]) =>
+      `========== ${filename} ==========\n\n${content}`
+    )
+    .join('\n\n\n');
+
   $('editorContent').innerHTML =
     '<pre class="code-preview"></pre>';
 
   $('editorContent').querySelector('pre').textContent =
-    activeProject.files['index.html'] ||
-    activeProject.files['vr.js'] ||
-    JSON.stringify(activeProject.files, null, 2);
+    source || 'This project contains no files.';
 
   if (spatial) {
-    spatial.addProjectPanel(
-      activeProject.name,
-      activeProject.kind
-    );
+    spatial.addProjectPanel(activeProject.name, activeProject.kind);
   }
 }
 
@@ -452,7 +493,7 @@ function previewProject() {
     return;
   }
 
-  const files = activeProject.files;
+  const files = activeProject.files || {};
 
   const html = files['index.html'] || '<h1>index.html missing</h1>';
   const css = files['style.css'] || '';
@@ -498,10 +539,7 @@ async function loadConversation() {
 
     if (!chatHistory.length) {
       chatHistory = [
-        {
-          role: 'assistant',
-          content: 'Systems online. How may I assist you?'
-        }
+        { role: 'assistant', content: 'Systems online. How may I assist you?' }
       ];
     }
 
@@ -511,10 +549,7 @@ async function loadConversation() {
     conversationId = crypto.randomUUID();
 
     chatHistory = [
-      {
-        role: 'assistant',
-        content: 'Systems online. How may I assist you?'
-      }
+      { role: 'assistant', content: 'Systems online. How may I assist you?' }
     ];
 
     await saveConversation();
@@ -559,10 +594,7 @@ function renderChatHistory() {
   container.innerHTML = '';
 
   chatHistory.forEach(message => {
-    if (
-      message.role === 'user' ||
-      message.role === 'assistant'
-    ) {
+    if (message.role === 'user' || message.role === 'assistant') {
       addMessage(message.role, message.content);
     }
   });
@@ -683,13 +715,12 @@ Use onFrame(fn) to register animation updates.
 Do not use tool calls.`;
 
 /* -------------------------------------------------------
-   ROBUST PROJECT BLOCK PARSER
+   PROJECT BLOCK PARSER
 ------------------------------------------------------- */
 
 function extractProject(response) {
   if (typeof response !== 'string') return null;
 
-  // Normalize escaped tags and HTML-encoded tags.
   const normalized = response
     .replace(/\\(?=<\/?JARVIS_PROJECT\b)/gi, '')
     .replace(/&lt;/gi, '<')
@@ -699,22 +730,19 @@ function extractProject(response) {
 
   if (!openingTag) return null;
 
-  const contentStart = openingTag.index + openingTag[0].length;
-  let content = normalized.slice(contentStart).trim();
+  let content = normalized
+    .slice(openingTag.index + openingTag[0].length)
+    .trim();
 
-  // Remove an optional Markdown JSON fence.
   content = content.replace(/^```(?:json)?\s*/i, '');
   content = content.replace(/\s*```$/, '');
 
-  // Find the beginning of the JSON object.
   const jsonStart = content.indexOf('{');
 
   if (jsonStart === -1) {
     throw new Error('Aucun objet JSON trouvé dans le bloc projet.');
   }
 
-  // Extract the first complete JSON object.
-  // This handles braces inside strings and escaped quotes.
   let depth = 0;
   let inString = false;
   let escaped = false;
@@ -753,12 +781,10 @@ function extractProject(response) {
     throw new Error('Le JSON du projet est incomplet.');
   }
 
-  const jsonText = content.slice(jsonStart, jsonEnd);
-
   let project;
 
   try {
-    project = JSON.parse(jsonText);
+    project = JSON.parse(content.slice(jsonStart, jsonEnd));
   } catch (error) {
     console.error('Project JSON parsing failed:', error);
     throw new Error('Le JSON généré est invalide : ' + error.message);
@@ -779,13 +805,9 @@ function extractProject(response) {
       throw new Error('Le projet web ne contient pas index.html.');
     }
 
-    if (!project.files['style.css']) {
-      project.files['style.css'] = '';
-    }
+    if (!project.files['style.css']) project.files['style.css'] = '';
+    if (!project.files['app.js']) project.files['app.js'] = '';
 
-    if (!project.files['app.js']) {
-      project.files['app.js'] = '';
-    }
   } else if (!project.files['vr.js']) {
     throw new Error('Le projet VR ne contient pas vr.js.');
   }
@@ -870,7 +892,6 @@ async function sendMessage() {
         'No response received.';
     }
 
-    // Diagnostic logs: visible in the browser console.
     console.log('[JARVIS DEBUG] Response received:', response);
 
     const hasProjectTag =
@@ -883,9 +904,7 @@ async function sendMessage() {
 
     if (hasProjectTag) {
       console.log('[JARVIS DEBUG] Extracting project...');
-
       project = extractProject(response);
-
       console.log('[JARVIS DEBUG] Extracted project:', project);
     }
 
@@ -940,30 +959,66 @@ async function sendMessage() {
 }
 
 /* -------------------------------------------------------
-   VOICE
+   FREE BRITISH VOICE
 ------------------------------------------------------- */
+
+function selectBritishVoice() {
+  if (!('speechSynthesis' in window)) return;
+
+  const voices = speechSynthesis.getVoices();
+
+  const preferences = [
+    /Microsoft Ryan Online \(Natural\)/i,
+    /Microsoft George/i,
+    /Microsoft Ryan/i,
+    /Google UK English Male/i,
+    /Daniel/i,
+    /Arthur/i,
+    /Oliver/i
+  ];
+
+  britishVoice = null;
+
+  for (const preference of preferences) {
+    britishVoice = voices.find(voice =>
+      preference.test(voice.name) &&
+      /^en-GB/i.test(voice.lang)
+    );
+
+    if (britishVoice) break;
+  }
+
+  if (!britishVoice) {
+    britishVoice = voices.find(voice =>
+      /^en-GB/i.test(voice.lang)
+    );
+  }
+}
+
+if ('speechSynthesis' in window) {
+  selectBritishVoice();
+  speechSynthesis.onvoiceschanged = selectBritishVoice;
+}
 
 function speakBrowser(text) {
   if (!('speechSynthesis' in window)) return;
 
   speechSynthesis.cancel();
 
+  if (!britishVoice) selectBritishVoice();
+
   const utterance = new SpeechSynthesisUtterance(
     text.replace(/<[^>]*>/g, '')
   );
 
   utterance.lang = 'en-GB';
-  utterance.rate = 0.96;
-  utterance.pitch = 0.88;
+  utterance.rate = 0.94;
+  utterance.pitch = 0.85;
+  utterance.volume = 1;
 
-  const voices = speechSynthesis.getVoices();
-
-  utterance.voice =
-    voices.find(voice =>
-      /daniel|george|oliver|arthur|ryan|guy/i.test(voice.name)
-    ) ||
-    voices.find(voice => voice.lang === 'en-GB') ||
-    null;
+  if (britishVoice) {
+    utterance.voice = britishVoice;
+  }
 
   speechSynthesis.speak(utterance);
 }
