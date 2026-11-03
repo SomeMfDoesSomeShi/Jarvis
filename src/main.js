@@ -1,3 +1,4 @@
+
 import './style.css';
 import * as THREE from 'three';
 import { createClient } from '@supabase/supabase-js';
@@ -36,6 +37,10 @@ let chatHistory = [
 ];
 
 let cloudReady = false;
+
+/* -------------------------------------------------------
+   GENERAL
+------------------------------------------------------- */
 
 function setStatus(status) {
   const element = $('connectionState');
@@ -111,6 +116,7 @@ function connectSupabase() {
       } else {
         cloudReady = false;
         conversationId = null;
+
         chatHistory = [
           {
             role: 'assistant',
@@ -143,9 +149,12 @@ async function loadCloudData() {
 
     cloudReady = true;
     setStatus('Cloud synchronisé');
+
   } catch (error) {
     console.error('Cloud synchronization error:', error);
+
     setStatus('Erreur de synchronisation');
+
     addMessage(
       'assistant',
       'Cloud synchronization failed: ' + error.message
@@ -171,18 +180,22 @@ async function saveSettings() {
     JSON.stringify(settings)
   );
 
-  $('settingsStatus').textContent = 'Paramètres enregistrés localement.';
+  $('settingsStatus').textContent =
+    'Paramètres enregistrés localement.';
 
   if (
     oldUrl !== settings.supabaseUrl ||
     oldKey !== settings.supabaseKey
   ) {
     connectSupabase();
+
   } else if (session && supabase) {
     try {
       await saveUserSettings();
+
       $('settingsStatus').textContent =
         'Paramètres enregistrés et synchronisés dans le cloud.';
+
     } catch (error) {
       $('settingsStatus').textContent =
         'Erreur de sauvegarde cloud : ' + error.message;
@@ -327,7 +340,9 @@ async function saveProject(project) {
     });
 
   if (error) {
-    throw new Error('Sauvegarde du projet impossible : ' + error.message);
+    throw new Error(
+      'Sauvegarde du projet impossible : ' + error.message
+    );
   }
 
   const index = projects.findIndex(p => p.id === project.id);
@@ -357,10 +372,18 @@ function renderProjects() {
       <span class="eyebrow">
         ${project.kind === 'vr' ? 'IMMERSIVE PROJECT' : 'WEB PROJECT'}
       </span>
+
       <h4>${escapeHtml(project.name)}</h4>
+
       <p>${new Date(project.updatedAt || Date.now()).toLocaleDateString()}</p>
-      <button class="tiny" data-open="${escapeHtml(project.id)}">Ouvrir</button>
-      <button class="tiny" data-export="${escapeHtml(project.id)}">Exporter</button>
+
+      <button class="tiny" data-open="${escapeHtml(project.id)}">
+        Ouvrir
+      </button>
+
+      <button class="tiny" data-export="${escapeHtml(project.id)}">
+        Exporter
+      </button>
     </article>
   `).join('');
 
@@ -380,6 +403,7 @@ function openProject(id) {
   showView('workspace');
 
   $('editorTitle').textContent = activeProject.name;
+
   $('editorContent').innerHTML =
     '<pre class="code-preview"></pre>';
 
@@ -467,6 +491,7 @@ async function loadConversation() {
 
   if (data) {
     conversationId = data.id;
+
     chatHistory = Array.isArray(data.messages)
       ? data.messages
       : [];
@@ -481,6 +506,7 @@ async function loadConversation() {
     }
 
     renderChatHistory();
+
   } else {
     conversationId = crypto.randomUUID();
 
@@ -520,7 +546,9 @@ async function saveConversation() {
     });
 
   if (error) {
-    throw new Error('Sauvegarde de la conversation impossible : ' + error.message);
+    throw new Error(
+      'Sauvegarde de la conversation impossible : ' + error.message
+    );
   }
 }
 
@@ -531,7 +559,10 @@ function renderChatHistory() {
   container.innerHTML = '';
 
   chatHistory.forEach(message => {
-    if (message.role === 'user' || message.role === 'assistant') {
+    if (
+      message.role === 'user' ||
+      message.role === 'assistant'
+    ) {
       addMessage(message.role, message.content);
     }
   });
@@ -652,42 +683,117 @@ Use onFrame(fn) to register animation updates.
 Do not use tool calls.`;
 
 /* -------------------------------------------------------
-   PROJECT BLOCK PARSER
+   ROBUST PROJECT BLOCK PARSER
 ------------------------------------------------------- */
 
 function extractProject(response) {
+  if (typeof response !== 'string') return null;
+
+  // Normalize escaped tags and HTML-encoded tags.
   const normalized = response
-    .replace(/\\(?=<\/?JARVIS_PROJECT>)/gi, '')
-    .replace(
-      /\\(?=<\/?(?:!DOCTYPE|html|head|body|meta|title|link|script|style|canvas)\b)/gi,
-      ''
-    );
+    .replace(/\\(?=<\/?JARVIS_PROJECT\b)/gi, '')
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>');
 
-  const match = normalized.match(
-    /<JARVIS_PROJECT>\s*([\s\S]*?)(?:\s*<\/JARVIS_PROJECT>\s*|$)/i
-  );
+  const openingTag = /<JARVIS_PROJECT\s*>/i.exec(normalized);
 
-  if (!match) return null;
+  if (!openingTag) return null;
 
-  const jsonText = match[1].replace(
-    /\\(?!["\\/bfnrtu])/g,
-    ''
-  );
+  const contentStart = openingTag.index + openingTag[0].length;
+  let content = normalized.slice(contentStart).trim();
 
-  const project = JSON.parse(jsonText);
+  // Remove an optional Markdown JSON fence.
+  content = content.replace(/^```(?:json)?\s*/i, '');
+  content = content.replace(/\s*```$/, '');
 
-  if (!project.files || typeof project.files !== 'object') {
-    throw new Error('Le projet généré ne contient pas de fichiers valides.');
+  // Find the beginning of the JSON object.
+  const jsonStart = content.indexOf('{');
+
+  if (jsonStart === -1) {
+    throw new Error('Aucun objet JSON trouvé dans le bloc projet.');
   }
 
-  if (project.kind !== 'vr' && !project.files['index.html']) {
-    throw new Error('Le projet web ne contient pas index.html.');
+  // Extract the first complete JSON object.
+  // This handles braces inside strings and escaped quotes.
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  let jsonEnd = -1;
+
+  for (let i = jsonStart; i < content.length; i++) {
+    const char = content[i];
+
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (char === '\\') {
+        escaped = true;
+      } else if (char === '"') {
+        inString = false;
+      }
+
+      continue;
+    }
+
+    if (char === '"') {
+      inString = true;
+    } else if (char === '{') {
+      depth++;
+    } else if (char === '}') {
+      depth--;
+
+      if (depth === 0) {
+        jsonEnd = i + 1;
+        break;
+      }
+    }
+  }
+
+  if (jsonEnd === -1) {
+    throw new Error('Le JSON du projet est incomplet.');
+  }
+
+  const jsonText = content.slice(jsonStart, jsonEnd);
+
+  let project;
+
+  try {
+    project = JSON.parse(jsonText);
+  } catch (error) {
+    console.error('Project JSON parsing failed:', error);
+    throw new Error('Le JSON généré est invalide : ' + error.message);
+  }
+
+  if (
+    !project.files ||
+    typeof project.files !== 'object' ||
+    Array.isArray(project.files)
+  ) {
+    throw new Error('Le projet ne contient pas de fichiers valides.');
+  }
+
+  const kind = project.kind === 'vr' ? 'vr' : 'web';
+
+  if (kind === 'web') {
+    if (!project.files['index.html']) {
+      throw new Error('Le projet web ne contient pas index.html.');
+    }
+
+    if (!project.files['style.css']) {
+      project.files['style.css'] = '';
+    }
+
+    if (!project.files['app.js']) {
+      project.files['app.js'] = '';
+    }
+  } else if (!project.files['vr.js']) {
+    throw new Error('Le projet VR ne contient pas vr.js.');
   }
 
   return {
     id: crypto.randomUUID(),
     name: project.name || 'New Project',
-    kind: project.kind === 'vr' ? 'vr' : 'web',
+    kind,
     files: project.files,
     updatedAt: new Date().toISOString()
   };
@@ -706,6 +812,7 @@ async function sendMessage() {
   input.value = '';
 
   addMessage('user', text);
+
   chatHistory.push({
     role: 'user',
     content: text
@@ -747,6 +854,7 @@ async function sendMessage() {
         });
 
         response = `Loaded ${project.name} into my context.`;
+
       } else {
         response = `I couldn't find a project named ${name}.`;
       }
@@ -762,14 +870,28 @@ async function sendMessage() {
         'No response received.';
     }
 
+    // Diagnostic logs: visible in the browser console.
+    console.log('[JARVIS DEBUG] Response received:', response);
+
+    const hasProjectTag =
+      /\\?<JARVIS_PROJECT\b/i.test(response) ||
+      /&lt;JARVIS_PROJECT\b/i.test(response);
+
+    console.log('[JARVIS DEBUG] Project tag detected:', hasProjectTag);
+
     let project = null;
 
-    if (response.includes('<JARVIS_PROJECT>') ||
-        response.includes('\\<JARVIS_PROJECT>')) {
+    if (hasProjectTag) {
+      console.log('[JARVIS DEBUG] Extracting project...');
+
       project = extractProject(response);
+
+      console.log('[JARVIS DEBUG] Extracted project:', project);
     }
 
     if (project) {
+      console.log('[JARVIS DEBUG] Saving project:', project.name);
+
       await saveProject(project);
 
       activeProject = project;
@@ -788,7 +910,10 @@ async function sendMessage() {
 
     try {
       await saveConversation();
+
     } catch (error) {
+      console.error('Conversation synchronization failed:', error);
+
       addMessage(
         'assistant',
         '⚠️ Conversation not synchronized: ' + error.message
@@ -874,6 +999,7 @@ async function speakPremium(text) {
         URL.revokeObjectURL(url);
       }
     }
+
   } catch (error) {
     console.warn('Premium voice failed:', error);
     speakBrowser(text);
