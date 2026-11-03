@@ -22,8 +22,35 @@ function previewProject(){if(!activeProject)return;if(activeProject.kind==='vr')
 async function callJarvis(messages,action='chat',extra={}){if(!supabase||!session)throw new Error('Connecte-toi à Supabase dans Configuration avant d’utiliser l’IA.');const r=await fetch(`${settings.supabaseUrl}/functions/v1/jarvis`,{method:'POST',headers:{'Content-Type':'application/json','Authorization':`Bearer ${session.access_token}`,'apikey':settings.supabaseKey},body:JSON.stringify({action,messages,...extra})});if(!r.ok)throw new Error(`Service IA (${r.status}) : ${(await r.text()).slice(0,220)}`);return action==='speech'?r.blob():r.json();}
 const systemPrompt=`You are J.A.R.V.I.S., a concise, professional spatial AI assistant. Keep spoken replies short. Never claim an action succeeded if it did not. If the user requests a project, return exactly one block and no other code fences: <JARVIS_PROJECT>{"name":"Project name","kind":"web or vr","files":{"index.html":"...","style.css":"...","app.js":"...","vr.js":"..."}}</JARVIS_PROJECT>. Use kind vr for immersive Three.js projects. A vr.js file must export function mount({THREE,scene,camera,renderer,addPanel,addButton,onFrame}) and create objects in the supplied scene. Use addButton(label,onSelect,position) for selectable spatial buttons, and onFrame(fn) to register animation updates. Do not import three. For web projects provide index.html, style.css, app.js. Do not use tool calls.`;
 async function sendMessage(){const text=$('chatInput').value.trim();if(!text)return;$('chatInput').value='';addMessage('user',text);chatHistory.push({role:'user',content:text});$('sendMessage').disabled=true;try{let response;if(/^\[search on internet (.+)\]$/i.test(text)){const q=text.match(/^\[search on internet (.+)\]$/i)[1],r=await fetch(`https://en.wikipedia.org/w/rest.php/v1/search/page?q=${encodeURIComponent(q)}&limit=5`),d=await r.json();response=(d.pages||[]).map(p=>`${p.title}: ${p.description||''}`).join('\n')||'No useful results found.';}else if(/^\[read code (.+)\]$/i.test(text)){const name=text.match(/^\[read code (.+)\]$/i)[1],p=projects.find(x=>x.name.toLowerCase()===name.toLowerCase());if(p){chatHistory.push({role:'system',content:`Project source loaded: ${p.name}\n${JSON.stringify(p.files)}`});response=`Loaded ${p.name} into my context.`;}else response=`I couldn't find a project named ${name}.`;}else{const r=await callJarvis([{role:'system',content:systemPrompt},...chatHistory.slice(-10)]);response=r.choices?.[0]?.message?.content||'No response received.';}
-const m=response.match(/<JARVIS_PROJECT>\s*([\s\S]*?)\s*<\/JARVIS_PROJECT>/i);if(m){const d=JSON.parse(m[1]),p={id:crypto.randomUUID(),name:d.name||'New Project',kind:d.kind==='vr'?'vr':'web',files:d.files||{},updatedAt:new Date().toISOString()};await saveProject(p);activeProject=p;openProject(p.id);response=`Project "${p.name}" created and saved. ${p.kind==='vr'?'Immersive scene module ready.':'Web application ready.'}`;}
-chatHistory.push({role:'assistant',content:response});addMessage('assistant',response);if(settings.premiumVoice)await speakPremium(response);else speakBrowser(response);
+// Detect and normalize AI-generated project blocks
+const normalizedResponse = response
+  .replace(/\\(?=<\/?JARVIS_PROJECT>)/gi, '')
+  .replace(/\\(?=<\/?(?:!DOCTYPE|html|head|body|meta|title|link|script|style|canvas)\b)/gi, '');
+
+const m = normalizedResponse.match(
+  /<JARVIS_PROJECT>\s*([\s\S]*?)\s*<\/JARVIS_PROJECT>/i
+);
+
+if (m) {
+  const jsonText = m[1].replace(/\\(?!["\\/bfnrtu])/g, '');
+  const d = JSON.parse(jsonText);
+
+  const p = {
+    id: crypto.randomUUID(),
+    name: d.name || 'New Project',
+    kind: d.kind === 'vr' ? 'vr' : 'web',
+    files: d.files || {},
+    updatedAt: new Date().toISOString()
+  };
+
+  await saveProject(p);
+  activeProject = p;
+  openProject(p.id);
+
+  response = `Project "${p.name}" created and saved. ${
+    p.kind === 'vr' ? 'Immersive scene module ready.' : 'Web application ready.'
+  }`;
+}chatHistory.push({role:'assistant',content:response});addMessage('assistant',response);if(settings.premiumVoice)await speakPremium(response);else speakBrowser(response);
 }catch(e){addMessage('assistant',`I couldn't complete that request: ${e.message}`);}finally{$('sendMessage').disabled=false;}}
 function speakBrowser(text){if(!('speechSynthesis'in window))return;speechSynthesis.cancel();const u=new SpeechSynthesisUtterance(text.replace(/<[^>]*>/g,''));u.lang='en-GB';u.rate=.96;u.pitch=.88;const voices=speechSynthesis.getVoices();u.voice=voices.find(v=>/daniel|george|oliver|arthur|ryan|guy/i.test(v.name))||voices.find(v=>v.lang==='en-GB')||null;speechSynthesis.speak(u);}
 async function speakPremium(text){const sentences=(text.match(/[^.!?]+[.!?]+|[^.!?]+$/g)||[text]).map(s=>s.trim()).filter(Boolean);try{for(const sentence of sentences){for(let i=0;i<sentence.length;i+=185){const blob=await callJarvis([],'speech',{text:sentence.slice(i,i+185),voice:settings.voice});const url=URL.createObjectURL(blob),audio=new Audio(url);await new Promise((resolve,reject)=>{audio.onended=resolve;audio.onerror=reject;audio.play().catch(reject);});URL.revokeObjectURL(url);}}}catch(e){console.warn('Premium voice failed',e);speakBrowser(text);}}
